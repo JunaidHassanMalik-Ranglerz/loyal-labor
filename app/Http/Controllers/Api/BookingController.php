@@ -536,105 +536,91 @@ class BookingController extends Controller
 
     // Customer: Broadcast request to all technicians in selected category
     public function broadcastRequest(Request $request)
-{
-    $request->validate([
-        'service_category_id' => 'required|exists:service_categories,id',
-        'district_id' => 'nullable|exists:districts,id',
-        'address' => 'required|string',
-        'city' => 'required|string',
-        'service_details' => 'required|string',
-        'emergency_level' => 'required|in:medium,high,emergency',
-        'additional_notes' => 'nullable|string',
-        'latitude' => 'nullable|numeric',
-        'longitude' => 'nullable|numeric',
-    ]);
+    {
+        $request->merge([
+            'latitude' => $request->input('latitude', $request->input('lat')),
+            'longitude' => $request->input('longitude', $request->input('lng', $request->input('long'))),
+        ]);
 
-    $customer = $request->user();
-    $now = Carbon::now();
-    $requestId = BookingReference::generateBroadcast($request->emergency_level);
-    $radiusService = app(BroadcastRadiusService::class);
-    $radiusService->ensureTables();
-    [$latitude, $longitude] = $radiusService->resolveCoordinates(
-        new Booking([
+        $request->validate([
+            'service_category_id' => 'required|exists:service_categories,id',
+            'district_id' => 'nullable|exists:districts,id',
+            'address' => 'required|string',
+            'city' => 'required|string',
+            'service_details' => 'required|string',
+            'emergency_level' => 'required|in:medium,high,emergency',
+            'additional_notes' => 'nullable|string',
+            'latitude' => 'required|numeric|between:-90,90',
+            'longitude' => 'required|numeric|between:-180,180',
+        ]);
+
+        $customer = $request->user();
+        $now = Carbon::now();
+        $requestId = BookingReference::generateBroadcast($request->emergency_level);
+        $radiusService = app(BroadcastRadiusService::class);
+        $radiusService->ensureTables();
+        $latitude = (float) $request->latitude;
+        $longitude = (float) $request->longitude;
+
+        $booking = Booking::create([
+            'customer_id' => $customer->id,
+            'technician_id' => null,
+            'booking_type' => 'broadcast',
+            'service_category_id' => $request->service_category_id,
+            'district_id' => $request->district_id,
+            'emergency_level' => $request->emergency_level,
+            'status' => 'pending',
+            'service_date' => $now->toDateString(),
+            'time_slot' => $now->format('H:i:s'),
+            'service_details' => $request->service_details,
             'address' => $request->address,
             'city' => $request->city,
-        ]),
-        $customer,
-        $request->latitude ? (float) $request->latitude : null,
-        $request->longitude ? (float) $request->longitude : null,
-        $request->address . ', ' . $request->city
-    );
+            'phone' => $request->phone ?? $customer->phone,
+            'additional_notes' => $request->additional_notes,
+            'booking_reference' => $requestId,
+            'expires_at' => null,
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'current_radius_km' => BroadcastRadiusService::RADIUS_START_KM,
+            'last_expand_prompt_at' => $now,
+        ]);
 
-    $booking = Booking::create([
-        'customer_id' => $customer->id,
-        'technician_id' => null,
-        'booking_type' => 'broadcast',
-        'service_category_id' => $request->service_category_id,
-        'district_id' => $request->district_id,
-        'emergency_level' => $request->emergency_level,
-        'status' => 'pending',
-        'service_date' => $now->toDateString(),
-        'time_slot' => $now->format('H:i:s'),
-        'service_details' => $request->service_details,
-        'address' => $request->address,
-        'city' => $request->city,
-        'phone' => $request->phone ?? $customer->phone,
-        'additional_notes' => $request->additional_notes,
-        'booking_reference' => $requestId,
-        'expires_at' => null,
-        'latitude' => $latitude,
-        'longitude' => $longitude,
-        'current_radius_km' => 20,
-        'last_expand_prompt_at' => $now,
-    ]);
+        if (Schema::hasColumn('users', 'latitude')) {
+            $customer->forceFill(['latitude' => $latitude, 'longitude' => $longitude])->save();
+        }
 
-    if ($latitude && $longitude && Schema::hasColumn('users', 'latitude')) {
-        $customer->forceFill(['latitude' => $latitude, 'longitude' => $longitude])->save();
+        $technicians = $radiusService->syncMatchingTechnicians($booking);
+
+        if ($technicians->isEmpty()) {
+            $booking->update(['last_expand_prompt_at' => now()->subSeconds(BroadcastRadiusService::EXPAND_AFTER_SECONDS)]);
+        }
+
+        $payload = $radiusService->pushScreen($booking->fresh(['serviceCategory', 'district', 'customer']), 'broadcast_created');
+        $booking->load(['serviceCategory', 'district']);
+
+        return response()->json(array_merge($payload, [
+            'message' => $technicians->isEmpty()
+                ? 'No available technicians found within ' . BroadcastRadiusService::RADIUS_START_KM . ' km. The search radius will expand if nobody accepts.'
+                : 'Your request has been broadcast to available technicians.',
+            'booking' => [
+                'id' => $booking->id,
+                'request_id' => $requestId,
+                'customer_id' => $booking->customer_id,
+                'booking_type' => $booking->booking_type,
+                'service_category' => $booking->serviceCategory?->name,
+                'service_category_id' => $booking->service_category_id,
+                'district' => $booking->district?->name,
+                'emergency_level' => $booking->emergency_level,
+                'status' => $booking->status,
+                'address' => $booking->address,
+                'city' => $booking->city,
+                'latitude' => $latitude,
+                'longitude' => $longitude,
+                'current_radius_km' => BroadcastRadiusService::RADIUS_START_KM,
+                'booking_reference' => $booking->booking_reference,
+            ],
+        ]), 201);
     }
-
-    $technicians = collect();
-    if ($latitude && $longitude) {
-        $technicians = $radiusService->findTechniciansInRadius(
-            (int) $request->service_category_id,
-            $latitude,
-            $longitude,
-            20
-        );
-    }
-
-    $radiusService->notifyTechnicians(
-        $booking,
-        $technicians,
-        20,
-        $request->emergency_level === 'emergency' ? 'Emergency request' : 'New service request',
-        'Go to pending requests to accept or reject this job.'
-    );
-
-    if ($technicians->isEmpty()) {
-        $booking->update(['last_expand_prompt_at' => now()->subMinutes(2)]);
-    }
-
-    $payload = $radiusService->pushScreen($booking, 'broadcast_created');
-    $booking->load(['serviceCategory', 'district']);
-
-    return response()->json(array_merge($payload, [
-        'message' => 'Your request has been broadcast to available technicians.',
-        'booking' => [
-            'id' => $booking->id,
-            'request_id' => $requestId,
-            'customer_id' => $booking->customer_id,
-            'booking_type' => $booking->booking_type,
-            'service_category' => $booking->serviceCategory?->name,
-            'service_category_id' => $booking->service_category_id,
-            'district' => $booking->district?->name,
-            'emergency_level' => $booking->emergency_level,
-            'status' => $booking->status,
-            'address' => $booking->address,
-            'city' => $booking->city,
-            'booking_reference' => $booking->booking_reference,
-        ],
-    ]), 201);
-}
 
     // Customer: Live broadcast status while waiting for first acceptance
     public function getBroadcastStatus(Request $request, $bookingId)
@@ -653,13 +639,18 @@ class BookingController extends Controller
 
         $radiusService = app(BroadcastRadiusService::class);
         $radiusService->ensureTables();
-        $payload = $radiusService->screenPayload($booking, 'status');
+        $expanded = $radiusService->maybeAutoExpand($booking);
+        $booking = $expanded['booking']->fresh(['serviceCategory', 'district', 'technician', 'customer']) ?: $expanded['booking'];
+        $radiusService->syncMatchingTechnicians($booking);
+        $payload = $radiusService->screenPayload($booking, $expanded['expanded'] ? 'radius_expanded' : 'status');
 
         if ($booking->status === 'accepted') {
             $payload['message'] = 'A technician accepted your request.';
             $payload['technician'] = $booking->technician;
         } elseif ($booking->status === 'cancelled') {
             $payload['message'] = 'You cancelled this request.';
+        } elseif ($expanded['expanded']) {
+            $payload['message'] = 'Search radius expanded to ' . (int) $booking->current_radius_km . ' km.';
         } else {
             $payload['message'] = 'Broadcasting your request. Waiting for first technician acceptance.';
         }
@@ -683,43 +674,20 @@ class BookingController extends Controller
 
         $radiusService = app(BroadcastRadiusService::class);
         $radiusService->ensureTables();
-        $nextRadius = $radiusService->nextRadius((int) ($booking->current_radius_km ?: 20));
-        [$lat, $lng] = $radiusService->resolveCoordinates($booking, $customer);
+        $result = $radiusService->expandToNextRadius($booking);
 
-        $alreadyNotified = BookingBroadcastNotified::where('booking_id', $booking->id)->pluck('technician_id')->all();
-        $rejected = Schema::hasTable('booking_rejections')
-            ? DB::table('booking_rejections')->where('booking_id', $booking->id)->pluck('technician_id')->all()
-            : [];
-        $exclude = array_unique(array_map('intval', array_merge($alreadyNotified, $rejected)));
+        if (!$result['expanded']) {
+            $payload = $radiusService->screenPayload($booking, 'status');
+            $payload['message'] = 'Maximum search radius of ' . BroadcastRadiusService::RADIUS_MAX_KM . ' km already reached.';
 
-        $newTechnicians = collect();
-        if ($lat && $lng) {
-            $newTechnicians = $radiusService->findTechniciansInRadius(
-                (int) $booking->service_category_id,
-                $lat,
-                $lng,
-                $nextRadius,
-                $exclude
-            );
+            return response()->json($payload);
         }
 
-        $booking->update([
-            'current_radius_km' => $nextRadius,
-            'last_expand_prompt_at' => now(),
-        ]);
-
-        $radiusService->notifyTechnicians(
-            $booking,
-            $newTechnicians,
-            $nextRadius,
-            'New service request',
-            'Go to pending requests to accept or reject this job.'
-        );
-
-        $payload = $radiusService->pushScreen($booking->fresh(['serviceCategory']), 'radius_expanded');
-        $payload['message'] = $newTechnicians->isEmpty()
-            ? 'No new technicians found within ' . $nextRadius . ' km.'
-            : $newTechnicians->count() . ' technicians have been notified.';
+        $booking = $result['booking'];
+        $payload = $radiusService->pushScreen($booking, 'radius_expanded');
+        $payload['message'] = $result['new_technicians']->isEmpty()
+            ? 'No new technicians found within ' . $result['current_radius_km'] . ' km.'
+            : $result['new_technicians']->count() . ' technicians have been notified.';
 
         return response()->json($payload);
     }
@@ -1153,6 +1121,101 @@ class BookingController extends Controller
                 'total' => $bookings->total(),
                 'last_page' => $bookings->lastPage(),
                 'requests' => $requests,
+            ],
+        ]);
+    }
+
+    public function getTechnicianBroadcastEmergencyRequests(Request $request)
+    {
+        $technician = $request->user();
+
+        if ($technician->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view broadcast emergency requests.',
+            ], 403);
+        }
+
+        app(BroadcastRadiusService::class)->ensureTables();
+
+        $categoryIds = $technician->serviceCategories()->pluck('service_categories.id')->map(fn ($id) => (int) $id)->all();
+        $rejectedIds = $this->technicianRejectedBookingIds($technician);
+        $perPage = $this->technicianHomePerPage($request);
+
+        $query = Booking::query()
+            ->where('booking_type', 'broadcast')
+            ->where('emergency_level', 'emergency')
+            ->where('status', 'pending')
+            ->where(function ($q) use ($technician, $categoryIds) {
+                $q->where('technician_id', $technician->id)
+                    ->orWhere(function ($open) use ($technician, $categoryIds) {
+                        $open->whereNull('technician_id');
+                        $open->where(function ($match) use ($technician, $categoryIds) {
+                            if (!empty($categoryIds)) {
+                                $match->whereIn('service_category_id', $categoryIds);
+                            }
+                            if (Schema::hasTable('booking_broadcast_notified')) {
+                                $match->orWhereExists(function ($notified) use ($technician) {
+                                    $notified->select(DB::raw(1))
+                                        ->from('booking_broadcast_notified as n')
+                                        ->whereColumn('n.booking_id', 'bookings.id')
+                                        ->where('n.technician_id', $technician->id);
+                                });
+                            }
+                            if (empty($categoryIds) && !Schema::hasTable('booking_broadcast_notified')) {
+                                $match->whereRaw('1 = 0');
+                            }
+                        });
+                    });
+            })
+            ->when(!empty($rejectedIds), function ($q) use ($rejectedIds) {
+                $q->whereNotIn('id', $rejectedIds);
+            })
+            ->with([
+                'customer' => function ($q) {
+                    $q->select('id', 'name', 'photo', 'is_verified', 'latitude', 'longitude', 'phone');
+                },
+                'serviceCategory:id,name,slug,icon',
+                'district:id,name',
+            ])
+            ->latest();
+
+        $bookings = $query->paginate($perPage)->appends($request->query());
+        $requests = collect($bookings->items())->map(function (Booking $booking) use ($technician) {
+            $card = $this->formatTechnicianPendingRequestCard($booking, $technician);
+            $card['is_emergency'] = true;
+            $card['request_type'] = 'emergency';
+            $card['request_type_label'] = 'Emergency';
+            $card['matched_by'] = (int) $booking->technician_id === (int) $technician->id
+                ? 'assigned'
+                : 'service_category';
+
+            return $card;
+        })->values();
+
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'emergency-bcast', 'hypothesisId' => 'A', 'location' => 'BookingController::getTechnicianBroadcastEmergencyRequests', 'message' => 'broadcast emergency list', 'data' => ['technician_id' => $technician->id, 'category_ids' => $categoryIds, 'total' => $bookings->total(), 'sample_ids' => $requests->pluck('id')->take(5)->values()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        return response()->json([
+            'success' => true,
+            'message' => $requests->isEmpty()
+                ? 'No broadcast emergency requests found.'
+                : 'Broadcast emergency requests retrieved successfully.',
+            'total' => $bookings->total(),
+            'data' => [
+                'current_page' => $bookings->currentPage(),
+                'per_page' => $bookings->perPage(),
+                'total' => $bookings->total(),
+                'last_page' => $bookings->lastPage(),
+                'requests' => $requests,
+            ],
+            'pusher' => [
+                'key' => config('services.pusher.key') ?: env('PUSHER_APP_KEY'),
+                'cluster' => config('services.pusher.cluster') ?: env('PUSHER_APP_CLUSTER', 'ap2'),
+                'channel' => 'private-technician.' . $technician->id,
+                'event' => 'broadcast.emergency.created',
+                'auth_endpoint' => '/broadcasting/auth',
             ],
         ]);
     }
@@ -2089,19 +2152,27 @@ private function transformAcceptedBooking($booking)
         'id' => $booking->id,
         'booking_reference' => $booking->booking_reference,
         'customer' => [
-            'id' => $booking->customer->id ?? null,
+            'id' => $booking->customer?->id,
             'name' => $customerName,
             'initials' => $this->customerInitials($customerName),
-            'is_verified' => (bool)($booking->customer->is_verified ?? false),
+            'photo' => $this->photoUrl($booking->customer->photo ?? null),
+            'is_verified' => (bool) ($booking->customer->is_verified ?? false),
             'phone' => $booking->phone ?? $booking->customer->phone ?? null,
         ],
+        'customer_name' => $customerName,
+        'customer_initials' => $this->customerInitials($customerName),
+        'customer_photo' => $this->photoUrl($booking->customer->photo ?? null),
+        'is_verified' => (bool) ($booking->customer->is_verified ?? false),
+        'phone' => $booking->phone ?? $booking->customer->phone ?? null,
+        'service_category' => $serviceCategory,
+        'service_details' => $booking->service_details,
+        'address' => $fullAddress ?: null,
         'service' => [
             'category' => $serviceCategory,
             'category_id' => $booking->service_category_id,
             'description' => $booking->service_details ?? $booking->additional_notes ?? null,
             'service_details' => $booking->service_details,
         ],
-        'address' => $fullAddress ?: null,
         'job_progress' => [
             'status' => $status,
             'status_label' => $this->technicianStatusBadge($status),
@@ -2515,17 +2586,89 @@ private function transformAcceptedBooking($booking)
         $this->notifyCustomer($booking->customer, $booking, $request->status);
 
         $payload = $this->transformAcceptedBooking($booking);
+        $timeline = $this->buildTechnicianJobProgressTimeline($booking);
+        $confirmAction = $this->jobProgressConfirmAction($booking);
 
         return response()->json([
             'success' => true,
             'message' => 'Booking status updated to ' . str_replace('_', ' ', $request->status),
             'current_status' => $payload['current_status'],
             'current_status_label' => $payload['current_status_label'],
+            'customer_name' => $payload['customer_name'],
+            'address' => $payload['address'],
+            'service_category' => $payload['service_category'],
+            'service_details' => $payload['service_details'],
             'booking' => $payload,
             'booking_reference' => $booking->booking_reference,
+            'job_progress' => $timeline,
+            'service_progress' => $timeline,
+            'confirm_action' => $confirmAction,
         ]);
     }
-    // Customer/Technician: Booking Status screen (track live progress)
+
+    public function getTechnicianJobStatus(Request $request, $bookingId)
+    {
+        $technician = $request->user();
+
+        if ($technician->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view job status.',
+            ], 403);
+        }
+
+        $booking = Booking::query()
+            ->where('technician_id', $technician->id)
+            ->where(function ($query) use ($bookingId) {
+                $query->where('id', $bookingId)
+                    ->orWhere('booking_reference', $bookingId)
+                    ->orWhere('booking_reference', ltrim((string) $bookingId, '#'));
+            })
+            ->with(['customer', 'technician', 'serviceCategory', 'district'])
+            ->first();
+
+        if (!$booking) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Job not found for this technician.',
+            ], 404);
+        }
+
+        $payload = $this->transformAcceptedBooking($booking);
+        $timeline = $this->buildTechnicianJobProgressTimeline($booking);
+        $confirmAction = $this->jobProgressConfirmAction($booking);
+
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'tech-job-status', 'hypothesisId' => 'A', 'location' => 'BookingController::getTechnicianJobStatus', 'message' => 'technician job status get', 'data' => ['booking_id' => $booking->id, 'status' => $booking->status, 'customer_name' => $payload['customer_name'] ?? null, 'address' => $payload['address'] ?? null, 'service_details' => $payload['service_details'] ?? null], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Technician job status retrieved successfully.',
+            'current_status' => $payload['current_status'],
+            'current_status_label' => $payload['current_status_label'],
+            'next_status' => $payload['next_status'],
+            'next_status_label' => $payload['next_status_label'],
+            'customer_name' => $payload['customer_name'],
+            'customer_initials' => $payload['customer_initials'],
+            'customer_photo' => $payload['customer_photo'],
+            'is_verified' => $payload['is_verified'],
+            'phone' => $payload['phone'],
+            'address' => $payload['address'],
+            'service_category' => $payload['service_category'],
+            'service_details' => $payload['service_details'],
+            'booking' => $payload,
+            'booking_reference' => $booking->booking_reference,
+            'job_progress' => $timeline,
+            'service_progress' => $timeline,
+            'confirm_action' => $confirmAction,
+            'automatic_notifications' => [
+                'title' => 'Automatic Notifications',
+                'body' => 'Customer will be notified automatically when you update your status.',
+            ],
+        ]);
+    }
+
     public function getBookingStatus(Request $request, $bookingId)
     {
         $user = $request->user();
@@ -2562,7 +2705,12 @@ private function transformAcceptedBooking($booking)
         }
 
         $payload = $this->transformAcceptedBooking($booking);
-        $timeline = $this->buildServiceProgressTimeline($booking);
+        $timeline = $this->buildTechnicianJobProgressTimeline($booking);
+        $confirmAction = $this->jobProgressConfirmAction($booking);
+
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'status-api', 'hypothesisId' => 'A,B', 'location' => 'BookingController::getBookingStatus', 'message' => 'status payload fields', 'data' => ['booking_id' => $booking->id, 'user_type' => $user->user_type, 'status' => $booking->status, 'has_customer' => (bool) $booking->customer, 'customer_name' => $payload['customer_name'] ?? null, 'address' => $payload['address'] ?? null, 'service_details' => $payload['service_details'] ?? null, 'timeline_count' => count($timeline), 'confirm_status' => $confirmAction['status'] ?? null], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
 
         return response()->json([
             'success' => true,
@@ -2571,10 +2719,124 @@ private function transformAcceptedBooking($booking)
             'current_status_label' => $payload['current_status_label'],
             'next_status' => $payload['next_status'],
             'next_status_label' => $payload['next_status_label'],
+            'customer_name' => $payload['customer_name'],
+            'customer_initials' => $payload['customer_initials'],
+            'customer_photo' => $payload['customer_photo'],
+            'is_verified' => $payload['is_verified'],
+            'phone' => $payload['phone'],
+            'address' => $payload['address'],
+            'service_category' => $payload['service_category'],
+            'service_details' => $payload['service_details'],
             'booking' => $payload,
             'booking_reference' => $booking->booking_reference,
+            'job_progress' => $timeline,
             'service_progress' => $timeline,
+            'confirm_action' => $confirmAction,
+            'automatic_notifications' => [
+                'title' => 'Automatic Notifications',
+                'body' => 'Customer will be notified automatically when you update your status.',
+            ],
         ]);
+    }
+
+    private function buildTechnicianJobProgressTimeline(Booking $booking): array
+    {
+        $status = $this->normalizeBookingStatus($booking->status);
+        $acceptedAt = $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('g:i A') : null;
+
+        $steps = [
+            [
+                'key' => 'accepted',
+                'title' => 'Request Accepted',
+                'icon' => 'check',
+                'done' => in_array($status, ['accepted', 'on_the_way', 'work_started', 'work_in_progress', 'completed'], true),
+                'is_current' => $status === 'accepted',
+                'description' => $acceptedAt
+                    ? 'You accepted the job at ' . $acceptedAt
+                    : 'Waiting for this job to be accepted',
+            ],
+            [
+                'key' => 'on_the_way',
+                'title' => 'On the Way',
+                'icon' => 'send',
+                'done' => in_array($status, ['on_the_way', 'work_started', 'work_in_progress', 'completed'], true),
+                'is_current' => $status === 'accepted',
+                'description' => 'Confirm when you\'re heading to the customer location',
+                'action_label' => $status === 'accepted' ? 'Confirm: On the Way' : null,
+            ],
+            [
+                'key' => 'work_started',
+                'title' => 'Work Started',
+                'icon' => 'wrench',
+                'done' => in_array($status, ['work_started', 'work_in_progress', 'completed'], true),
+                'is_current' => $status === 'on_the_way',
+                'description' => 'Mark when you begin the service at the location',
+                'action_label' => $status === 'on_the_way' ? 'Confirm: Work Started' : null,
+            ],
+            [
+                'key' => 'work_in_progress',
+                'title' => 'Work in Progress',
+                'icon' => 'hammer',
+                'done' => in_array($status, ['work_in_progress', 'completed'], true),
+                'is_current' => $status === 'work_started',
+                'description' => 'Update progress and add notes during the job',
+                'action_label' => $status === 'work_started' ? 'Confirm: Work in Progress' : null,
+            ],
+            [
+                'key' => 'completed',
+                'title' => 'Completed',
+                'icon' => 'check-circle',
+                'done' => $status === 'completed',
+                'is_current' => $status === 'work_in_progress',
+                'description' => 'Finalize the job and request customer review',
+                'action_label' => $status === 'work_in_progress' ? 'Confirm: Completed' : null,
+                'email_on_complete' => true,
+                'email_note' => 'An OTP email will be sent to the customer to verify completion.',
+            ],
+        ];
+
+        foreach ($steps as &$step) {
+            if ($step['done']) {
+                $step['status'] = 'Done';
+            } elseif ($step['is_current']) {
+                $step['status'] = 'Current';
+            } else {
+                $step['status'] = 'Pending';
+            }
+        }
+        unset($step);
+
+        return $steps;
+    }
+
+    private function jobProgressConfirmAction(Booking $booking): ?array
+    {
+        $status = $this->normalizeBookingStatus($booking->status);
+        $next = $this->nextJobStatus($status);
+
+        if (!$next) {
+            return null;
+        }
+
+        $labels = [
+            'on_the_way' => 'Confirm: On the Way',
+            'work_started' => 'Confirm: Work Started',
+            'work_in_progress' => 'Confirm: Work in Progress',
+            'completed' => 'Confirm: Completed',
+        ];
+
+        return [
+            'available' => true,
+            'label' => $labels[$next['status']] ?? ('Confirm: ' . $next['label']),
+            'status' => $next['status'],
+            'method' => 'POST',
+            'endpoint' => '/api/bookings/' . $booking->id . '/status',
+            'body' => ['status' => $next['status']],
+            'email_on_complete' => $next['status'] === 'completed',
+            'email_note' => $next['status'] === 'completed'
+                ? 'An OTP email will be sent to the customer to verify completion.'
+                : null,
+        ];
     }
 
     private function buildServiceProgressTimeline(Booking $booking): array

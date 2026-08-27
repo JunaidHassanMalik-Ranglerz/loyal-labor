@@ -88,7 +88,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::match(['get', 'post'], '/technician/active-jobs', [BookingController::class, 'activeJobs']);
     Route::match(['get', 'post'], '/technician/pending-requests', [BookingController::class, 'pendingRequests']);
     Route::match(['get', 'post'], '/technician/booking-requests', [BookingController::class, 'pendingRequests']);
+    Route::match(['get', 'post'], '/technician/broadcast-emergency-requests', [BookingController::class, 'getTechnicianBroadcastEmergencyRequests']);
+    Route::match(['get', 'post'], '/technician/emergency-broadcast-requests', [BookingController::class, 'getTechnicianBroadcastEmergencyRequests']);
     Route::match(['get', 'post'], '/technician/booking-history', [BookingController::class, 'technicianBookingHistory']);
+    Route::get('/technician/job-status-get/{bookingId}', [BookingController::class, 'getTechnicianJobStatus']);
+    Route::get('/technician/job-status/{bookingId}', [BookingController::class, 'getTechnicianJobStatus']);
+    Route::get('/technician/job-status/{bookingId}/get', [BookingController::class, 'getTechnicianJobStatus']);
 
     // Bookings
     Route::post('/bookings/broadcast', [BookingController::class, 'broadcastRequest']);
