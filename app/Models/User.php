@@ -54,6 +54,8 @@ class User extends Authenticatable
         'photo_verified' => 'boolean',
         'certificates_verified' => 'boolean',
         'currently_available' => 'boolean',
+        'latitude' => 'float',
+        'longitude' => 'float',
     ];
 
     /**
@@ -284,6 +286,80 @@ class User extends Authenticatable
         return true;
     }
 
+    /**
+     * True when the technician still has this exact plan within its validity period.
+     * Used to block re-buying the same plan until it expires (upgrades allowed).
+     */
+    public function hasUnexpiredPlan(int $subscriptionId): bool
+    {
+        // Only a genuinely paid+active subscription blocks same-plan repurchase.
+        // Pending/failed PayFast checkouts must NOT look like an owned plan.
+        if ((int) ($this->subscription_id ?? 0) !== $subscriptionId) {
+            return false;
+        }
+
+        return $this->hasActiveSubscription() && $this->isPaymentVerified();
+    }
+
+    public function isPaymentVerified(): bool
+    {
+        return ($this->payment_status ?? null) === 'verified';
+    }
+
+    /**
+     * Fully bookable only when docs + payment are verified and subscription is active.
+     */
+    public function isAccountActivated(): bool
+    {
+        return (string) ($this->status ?? '') === 'active'
+            && $this->allDocumentsVerified()
+            && $this->isPaymentVerified()
+            && $this->hasActiveSubscription();
+    }
+
+    /** Mark status active only when docs and payment are both verified. */
+    public function syncActivationStatus(): void
+    {
+        if ($this->user_type !== 'technician') {
+            return;
+        }
+
+        if ($this->allDocumentsVerified() && $this->isPaymentVerified()) {
+            $data = ['status' => 'active'];
+            if ($this->subscription_id && ($this->subscription ?? null) !== 'active') {
+                $data['subscription'] = 'active';
+            }
+            $this->update($data);
+            return;
+        }
+
+        if ((string) ($this->status ?? '') === 'active') {
+            // Incomplete verification must not stay bookable as "active".
+            $this->update(['status' => 'pending']);
+        }
+    }
+
+    /**
+     * SQL filter matching isAccountActivated().
+     * Use on customer-facing lists and booking broadcast matching.
+     */
+    public function scopeWhereAccountActivated($query)
+    {
+        return $query
+            ->where('users.status', 'active')
+            ->where('users.payment_status', 'verified')
+            ->where('users.subscription', 'active')
+            ->whereNotNull('users.subscription_id')
+            ->where('users.cnic_front_verified', true)
+            ->where('users.cnic_back_verified', true)
+            ->where('users.photo_verified', true)
+            ->where('users.certificates_verified', true)
+            ->where(function ($q) {
+                $q->whereNull('users.subscription_end')
+                    ->orWhereDate('users.subscription_end', '>=', now()->toDateString());
+            });
+    }
+
     public function activeFeatureKeys(): array
     {
         if (!$this->hasActiveSubscription()) {
@@ -334,8 +410,8 @@ class User extends Authenticatable
 
     public function scopePublicTechnicians($query)
     {
-        return $query->where('user_type', 'technician')
-            ->where('status', 'active');
+        return $query->where('users.user_type', 'technician')
+            ->whereAccountActivated();
     }
 
     public function workGalleries()

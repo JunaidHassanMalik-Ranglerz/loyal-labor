@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Preview — LoyLabor Secure Checkout</title>
+<style>
+:root{--ll-navy:#071A3D;--ll-royal:#1345A3;--ll-secondary:#1F4E6D;--ll-white:#FFFFFF;--ll-bg:#F5F8FC;--ll-border:#E2E8F0;--ll-muted:#64748B;--ll-text:#0F172A;--ll-radius:16px;--ll-shadow:0 12px 40px rgba(7,26,61,.10)}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:radial-gradient(1200px 500px at 10% -10%,rgba(19,69,163,.18),transparent 55%),radial-gradient(900px 420px at 100% 0%,rgba(31,78,109,.14),transparent 50%),var(--ll-bg);color:var(--ll-text)}
+.ll-shell{min-height:100vh;display:flex;flex-direction:column;padding:16px;max-width:390px;margin:0 auto}
+.ll-header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.ll-back{width:44px;height:44px;border-radius:12px;border:1px solid var(--ll-border);background:#fff;display:flex;align-items:center;justify-content:center;text-decoration:none;color:var(--ll-navy)}
+.ll-brand{display:flex;gap:10px;align-items:center}.ll-logo{width:40px;height:40px;border-radius:10px;background:linear-gradient(145deg,var(--ll-navy),var(--ll-royal));color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px}
+.ll-brand strong{display:block;font-size:15px;color:var(--ll-navy)}.ll-brand span{display:block;font-size:12px;color:var(--ll-muted)}
+.ll-hero{background:linear-gradient(145deg,var(--ll-navy) 0%,var(--ll-royal) 62%,var(--ll-secondary) 100%);color:#fff;border-radius:20px;padding:22px 20px;box-shadow:var(--ll-shadow);margin-bottom:16px}
+.ll-badge{display:inline-flex;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);border-radius:999px;padding:6px 10px;font-size:11px;font-weight:600;margin-bottom:12px;text-transform:uppercase}
+.ll-hero h1{margin:0 0 8px;font-size:22px}.ll-hero p{margin:0;font-size:13px;opacity:.9;line-height:1.5}
+.ll-card{background:#fff;border:1px solid var(--ll-border);border-radius:var(--ll-radius);box-shadow:var(--ll-shadow);padding:18px;margin-bottom:14px}
+.ll-card h2{margin:0 0 14px;font-size:15px;color:var(--ll-navy)}
+.ll-plan-name{font-size:18px;font-weight:700;color:var(--ll-navy);margin:0 0 4px}.ll-plan-meta{font-size:13px;color:var(--ll-muted);margin:0 0 12px}
+.ll-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;font-size:14px}.ll-row+.ll-row{border-top:1px solid #F1F5F9}.label{color:var(--ll-muted)}.value{font-weight:600}.total .label,.total .value{color:var(--ll-navy);font-size:16px;font-weight:700}
+.ll-note{display:flex;gap:10px;background:#EFF6FF;border:1px solid #DBEAFE;color:var(--ll-secondary);border-radius:12px;padding:12px;font-size:12px;line-height:1.45;margin-bottom:14px}
+.ll-method{display:flex;gap:12px;align-items:center;border:1px solid var(--ll-border);border-radius:14px;padding:12px;background:#FAFCFF;margin-bottom:10px}
+.ll-method-icon{width:42px;height:42px;border-radius:12px;background:linear-gradient(145deg,#E8EEF9,#F8FAFC);color:var(--ll-royal);display:flex;align-items:center;justify-content:center;font-weight:700}
+.ll-cta{width:100%;min-height:52px;border:0;border-radius:14px;background:linear-gradient(135deg,var(--ll-navy),var(--ll-royal));color:#fff;font-size:16px;font-weight:700;box-shadow:0 10px 24px rgba(19,69,163,.28)}
+.ll-foot{margin-top:auto;padding-top:18px;text-align:center;font-size:11px;color:var(--ll-muted)}
+</style>
+</head>
+<body>
+<div class="ll-shell">
+  <header class="ll-header">
+    <a class="ll-back" href="#">←</a>
+    <div class="ll-brand"><div class="ll-logo">LL</div><div><strong>LoyLabor</strong><span>Encrypted payment session</span></div></div>
+  </header>
+  <section class="ll-hero">
+    <div class="ll-badge">🔒 Secure Checkout</div>
+    <h1>Confirm &amp; pay for your plan</h1>
+    <p>You’ll continue to PayFast’s official payment page to complete this purchase safely.</p>
+  </section>
+  <section class="ll-card">
+    <h2>Subscription summary</h2>
+    <p class="ll-plan-name">Basic Plan</p>
+    <p class="ll-plan-meta">1 Month</p>
+    <div class="ll-row"><span class="label">Original price</span><span class="value">PKR 600.00</span></div>
+    <div class="ll-row"><span class="label">Discount (5%)</span><span class="value">− PKR 30.00</span></div>
+    <div class="ll-row total"><span class="label">Total payable</span><span class="value">PKR 570.00</span></div>
+  </section>
+  <section class="ll-card">
+    <h2>Pay with PayFast</h2>
+    <div class="ll-note"><span>🛡️</span><div>Bank, card, wallet, and Raast options are provided on the official PayFast checkout. LoyLabor never stores your card or bank credentials.</div></div>
+    <div class="ll-method"><div class="ll-method-icon">B</div><div><strong>Bank Account</strong><div style="font-size:12px;color:#64748B">Direct bank transfer via PayFast</div></div></div>
+    <div class="ll-method"><div class="ll-method-icon">C</div><div><strong>Debit / Credit Card</strong><div style="font-size:12px;color:#64748B">Processed by PayFast</div></div></div>
+    <div class="ll-method"><div class="ll-method-icon">W</div><div><strong>Mobile Wallet</strong><div style="font-size:12px;color:#64748B">Supported wallets on PayFast</div></div></div>
+    <div class="ll-method"><div class="ll-method-icon">R</div><div><strong>Raast</strong><div style="font-size:12px;color:#64748B">Instant account payments</div></div></div>
+  </section>
+  <button class="ll-cta">Pay Securely — PKR 570.00</button>
+  <p class="ll-foot">Order <strong>LOY-DEMO-PREVIEW</strong> · Protected by PayFast</p>
+</div>
+</body>
+</html>

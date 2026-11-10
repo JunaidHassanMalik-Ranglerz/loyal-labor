@@ -3,18 +3,25 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Traits\ResolvesSanctumApiUser;
 use App\Models\Booking;
 use App\Models\ServiceCategory;
 use App\Models\TechnicianAvailability;
 use App\Models\TechnicianReview;
 use App\Models\TechnicianWorkGallery;
 use App\Models\User;
+use App\Services\BroadcastRadiusService;
+use App\Services\GoogleDistanceService;
+use App\Support\GeoDistance;
+use App\Support\UserLocation;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 class TechnicianController extends Controller
 {
+    use ResolvesSanctumApiUser;
+
     //
 	public function submitVerification(Request $request)
 {
@@ -105,12 +112,54 @@ class TechnicianController extends Controller
             ], 404);
         }
 
+        if (!$user->allDocumentsVerified()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'All documents must be verified by admin before you can submit payment / activate.',
+            ], 403);
+        }
+
+        // Same plan cannot be purchased again until it expires. Other plans (upgrade) are allowed.
+        if ($user->hasUnexpiredPlan((int) $subscription->id)) {
+            $planName = $subscription->name ?: $subscription->plan_type_label;
+            $expiry = $user->subscription_end
+                ? \Illuminate\Support\Carbon::parse($user->subscription_end)->format('d M Y')
+                : null;
+            $message = 'You already have an active ' . $planName . ' plan'
+                . ($expiry ? ' until ' . $expiry : '')
+                . '. You cannot purchase this plan again until it expires. You can upgrade to a different plan.';
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+                'toast_message' => $message,
+                'code' => 'plan_already_active',
+                'can_upgrade' => true,
+                'current_plan' => [
+                    'id' => $subscription->id,
+                    'name' => $planName,
+                    'expires_at' => $user->subscription_end,
+                ],
+            ], 409);
+        }
+
+        // Manual / offline methods stay pending until admin verifies.
+        // PayFast purchases must use POST /api/payments/payfast/initiate.
+        $paymentMethod = strtolower((string) ($request->payment_method ?? 'bank_transfer'));
+        if ($paymentMethod === 'payfast') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Please use POST /api/payments/payfast/initiate for PayFast subscription payments.',
+                'toast_message' => 'Use PayFast checkout to complete this purchase.',
+                'code' => 'use_payfast_initiate',
+            ], 422);
+        }
+
         $data = [
             'subscription_id' => $subscription->id,
-            'subscription' => 'active',
-            'payment_status' => 'verified',
+            'subscription' => 'pending',
+            'payment_status' => 'pending',
             'subscription_end' => $subscription->endsAtFrom(now())->toDateString(),
-            'status' => 'active',
         ];
 
         // #region agent log
@@ -128,13 +177,46 @@ class TechnicianController extends Controller
         $user->update($data);
         $user->refresh()->load('subscriptionPlan');
 
+        $plan = $user->subscriptionPlan;
+        $planPayload = $plan ? $plan->toApiArray() : null;
+        $planName = is_array($planPayload) ? ($planPayload['name'] ?? 'subscription') : 'subscription';
+        $durationLabel = is_array($planPayload) ? (string) ($planPayload['duration_label'] ?? '') : '';
+        $planLabel = trim($planName . ($durationLabel !== '' ? ' — ' . $durationLabel : ''));
+        $expiry = $user->subscription_end
+            ? \Illuminate\Support\Carbon::parse($user->subscription_end)->format('d M Y')
+            : null;
+        $amount = isset($planPayload['payable_price'])
+            ? 'PKR ' . number_format((float) $planPayload['payable_price'], 0)
+            : null;
+
+        app(BroadcastRadiusService::class)->notifyUser(
+            $user,
+            'Payment Submitted',
+            'Your ' . $planLabel . ' payment is under review. Your account will activate after payment verification.',
+            [
+                'type' => 'subscription_payment_pending',
+                'subscription_id' => $subscription->id,
+                'plan_name' => $planName,
+                'plan_label' => $planLabel,
+                'amount' => $amount,
+                'subscription_end' => $user->subscription_end,
+                'expiry_date' => $expiry,
+                'payment_status' => $user->payment_status,
+                'open' => 'activation',
+            ],
+            'subscription_payment_pending'
+        );
+
         return response()->json([
             'success' => true,
-            'message' => 'Subscription plan assigned successfully.',
+            'message' => 'Payment submitted. Account will activate after payment verification.',
+            'toast_message' => 'Payment submitted for review.',
             'payment_method' => $user->payment_method,
-            'subscription' => $user->subscriptionPlan ? $user->subscriptionPlan->toApiArray() : null,
+            'payment_status' => $user->payment_status,
+            'subscription' => $planPayload,
             'subscription_end' => $user->subscription_end,
             'status' => $user->status,
+            'is_account_active' => $user->isAccountActivated(),
         ]);
     }
 
@@ -168,6 +250,99 @@ class TechnicianController extends Controller
             'currently_available' => Schema::hasColumn('users', 'currently_available')
                 ? (bool) ($user->currently_available ?? true)
                 : true,
+        ]);
+    }
+
+    // GET /api/technician/activation — "Account Pending Activation" screen
+    public function activationScreen(Request $request)
+    {
+        $user = $request->user();
+
+        if ($user->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view activation status.',
+            ], 403);
+        }
+
+        $documentsVerified = $user->allDocumentsVerified();
+        $paymentVerified = $user->isPaymentVerified();
+        $subscriptionActive = $user->hasActiveSubscription();
+        $accountStatus = (string) ($user->status ?? 'pending');
+        $isActive = $user->isAccountActivated();
+        $paymentRequired = $documentsVerified && !$paymentVerified;
+
+        $reviewStatus = match (true) {
+            $accountStatus === 'rejected' => 'rejected',
+            $documentsVerified => 'completed',
+            default => 'pending',
+        };
+
+        $subtitle = match (true) {
+            $isActive => 'Your account is active and ready for bookings.',
+            !$documentsVerified => 'Your documents are under review.',
+            !$paymentVerified => 'Documents verified. Submit payment to activate your account.',
+            default => 'Your profile is under review.',
+        };
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'title' => $isActive ? 'Account Active' : 'Account Pending Activation',
+                'subtitle' => $subtitle,
+                'payment_required' => $paymentRequired,
+                'payment_banner' => [
+                    'show' => $paymentRequired,
+                    'title' => $paymentRequired ? 'Payment Required to Activate' : null,
+                    'message' => $paymentRequired
+                        ? 'Your documents have been verified. To start receiving bookings, you must activate your account with a subscription plan.'
+                        : null,
+                ],
+                'checklist' => [
+                    [
+                        'key' => 'documents_verified',
+                        'label' => 'Documents Verified',
+                        'done' => $documentsVerified,
+                        'status' => $documentsVerified ? 'verified' : 'pending',
+                        'status_label' => $documentsVerified ? 'Verified' : 'Pending',
+                    ],
+                    [
+                        'key' => 'account_under_review',
+                        'label' => 'Account Under Review',
+                        'done' => $documentsVerified,
+                        'status' => $reviewStatus,
+                        'status_label' => $documentsVerified ? 'Approved' : ($reviewStatus === 'rejected' ? 'Rejected' : 'Pending'),
+                    ],
+                    [
+                        'key' => 'subscription_required',
+                        'label' => 'Subscription Required',
+                        'done' => $paymentVerified && $subscriptionActive,
+                        'status' => ($paymentVerified && $subscriptionActive) ? 'active' : ($paymentVerified ? 'pending' : 'required'),
+                        'status_label' => ($paymentVerified && $subscriptionActive)
+                            ? 'Active'
+                            : ($paymentVerified ? 'Pending' : 'Required'),
+                    ],
+                ],
+                'documents' => [
+                    'cnic_front' => !is_null($user->cnic_front),
+                    'cnic_back' => !is_null($user->cnic_back),
+                    'photo' => !is_null($user->photo),
+                    'certificates' => !empty($user->certificates),
+                ],
+                'verification' => [
+                    'cnic_front_verified' => (bool) $user->cnic_front_verified,
+                    'cnic_back_verified' => (bool) $user->cnic_back_verified,
+                    'photo_verified' => (bool) $user->photo_verified,
+                    'certificates_verified' => (bool) $user->certificates_verified,
+                    'all_verified' => $documentsVerified,
+                ],
+                'account_status' => $accountStatus,
+                'payment_status' => $user->payment_status ?? 'none',
+                'subscription_active' => $subscriptionActive,
+                'subscription_end' => $user->subscription_end,
+                'can_activate' => $paymentRequired,
+                'is_account_active' => $isActive,
+            ],
         ]);
     }
 
@@ -266,6 +441,15 @@ class TechnicianController extends Controller
 
         $isAvailable = $request->boolean('is_available');
 
+        if ($isAvailable && !$user->isAccountActivated()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Activate your account with a subscription before going available for bookings.',
+                'currently_available' => (bool) ($user->currently_available ?? false),
+                'is_account_active' => false,
+            ], 403);
+        }
+
         $user->update([
             'currently_available' => $isAvailable,
         ]);
@@ -290,12 +474,13 @@ class TechnicianController extends Controller
 
     $technician = User::where('id', $request->technician_id)
         ->where('user_type', 'technician')
+        ->whereAccountActivated()
         ->first();
 
     if (!$technician) {
         return response()->json([
             'success' => false,
-            'message' => 'Technician not found.',
+            'message' => 'Technician not found or account not activated.',
         ], 404);
     }
 
@@ -316,31 +501,76 @@ class TechnicianController extends Controller
             'sort_by' => 'nullable|in:rating,distance,name,featured',
             'service_category_id' => 'nullable|integer|exists:service_categories,id',
             'category' => 'nullable',
+            'search' => 'nullable|string|max:100',
+            'q' => 'nullable|string|max:100',
+            'name' => 'nullable|string|max:100',
+            'city' => 'nullable|string|max:100',
+            'district_id' => 'nullable|integer|exists:districts,id',
             'latitude' => 'nullable|numeric|between:-90,90',
             'longitude' => 'nullable|numeric|between:-180,180',
-            'radius_km' => 'nullable|numeric|min:1|max:200',
+            'lat' => 'nullable|numeric|between:-90,90',
+            'lng' => 'nullable|numeric|between:-180,180',
+            'long' => 'nullable|numeric|between:-180,180',
+            // Accepted for compatibility; discovery is hard-capped at 25 km.
+            'radius_km' => 'nullable|numeric|min:1|max:25',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:100',
         ]);
 
-        $filter = $request->input('filter', 'all');
-        $customerLat = $request->filled('latitude') ? (float) $request->latitude : null;
-        $customerLng = $request->filled('longitude') ? (float) $request->longitude : null;
-        $radiusKm = (float) ($request->input('radius_km', 50));
+        $filter = $request->input('filter', 'nearest');
+        $search = trim((string) (
+            $request->input('search')
+            ?? $request->input('q')
+            ?? $request->input('name')
+            ?? ''
+        ));
+        $authUser = $this->resolveSanctumUser($request);
+        [$customerLat, $customerLng, $locationSource] = UserLocation::resolve($request, $authUser, true);
+        $radiusKm = GeoDistance::discoveryRadiusKm(
+            $request->filled('radius_km') ? (float) $request->input('radius_km') : null
+        );
+        $haversineSql = GeoDistance::usersHaversineSql();
+        $districtId = $request->filled('district_id') ? (int) $request->district_id : null;
 
-        if ($filter === 'nearest' && ($customerLat === null || $customerLng === null)) {
+        if ($customerLat === null || $customerLng === null) {
             return response()->json([
                 'success' => false,
-                'message' => 'latitude and longitude are required for nearest filter (Google Maps structure ready).',
-                'google_maps' => [
-                    'required_fields' => ['latitude', 'longitude'],
-                    'optional_fields' => ['radius_km'],
-                    'integration_status' => 'pending',
+                'message' => 'No location found. POST /api/location with latitude & longitude (auth required) to save GPS in DB, or send latitude/longitude on this request.',
+                'location' => [
+                    'save_endpoint' => [
+                        'method' => 'POST',
+                        'url' => '/api/location',
+                        'auth' => 'Bearer token required',
+                        'form_fields' => ['latitude', 'longitude'],
+                        'aliases' => ['lat', 'lng', 'long'],
+                    ],
+                    'radius_km' => GeoDistance::TECHNICIAN_DISCOVERY_RADIUS_KM,
+                    'source' => $locationSource,
                 ],
             ], 422);
         }
 
         $query = User::query()
             ->where('users.user_type', 'technician')
-            ->where('users.status', 'active');
+            ->whereAccountActivated()
+            ->whereNotNull('users.latitude')
+            ->whereNotNull('users.longitude')
+            ->select('users.*')
+            ->selectRaw($haversineSql . ' as distance_km', [$customerLat, $customerLng, $customerLat])
+            ->whereRaw($haversineSql . ' <= ?', [$customerLat, $customerLng, $customerLat, $radiusKm])
+            ->orderBy('distance_km');
+
+        // Home search: "carpenter" → category; "ali" → name (any category)
+        if ($search !== '') {
+            $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $search) . '%';
+            $query->where(function ($q) use ($like) {
+                $q->where('users.name', 'LIKE', $like)
+                    ->orWhereHas('serviceCategories', function ($categoryQuery) use ($like) {
+                        $categoryQuery->where('service_categories.name', 'LIKE', $like)
+                            ->orWhere('service_categories.slug', 'LIKE', $like);
+                    });
+            });
+        }
 
         if ($request->filled('service_category_id')) {
             $categoryId = (int) $request->service_category_id;
@@ -373,16 +603,33 @@ class TechnicianController extends Controller
         }
 
         if ($filter === 'top_rated' && Schema::hasTable('technician_reviews')) {
-            $query->having('review_count', '>', 0)
-                ->orderByDesc('avg_rating')
-                ->orderByDesc('review_count');
+            $query->having('review_count', '>', 0);
         }
 
-        if ($request->filled('district_id')) {
-            $query->where('users.district_id', $request->district_id);
+        if ($districtId) {
+            $query->where('users.district_id', $districtId);
         }
 
-        $technicians = $query->with(['serviceCategories', 'availabilities', 'subscriptionPlan'])->get();
+        // Full matching set first (distance filter already in SQL) — then optional page slice.
+        $technicians = $query->with(['serviceCategories', 'availabilities', 'subscriptionPlan'])->get()->values();
+
+        // PHP safety net: re-check Haversine <= radius and drop invalid coords / float edge cases.
+        $technicians = $technicians->filter(function ($tech) use ($customerLat, $customerLng, $radiusKm) {
+            $distance = GeoDistance::haversineKm(
+                $customerLat,
+                $customerLng,
+                $tech->latitude !== null ? (float) $tech->latitude : null,
+                $tech->longitude !== null ? (float) $tech->longitude : null
+            );
+
+            if ($distance === null || $distance > $radiusKm) {
+                return false;
+            }
+
+            $tech->distance_km = round($distance, 3);
+
+            return true;
+        })->values();
 
         $ratingBreakdowns = [];
         if (Schema::hasTable('technician_reviews') && $technicians->isNotEmpty()) {
@@ -398,9 +645,10 @@ class TechnicianController extends Controller
             }
         }
 
-        $mapped = $technicians->map(function ($tech) use ($customerLat, $customerLng, $request, $ratingBreakdowns) {
+        $mapped = $technicians->map(function ($tech) use ($request, $ratingBreakdowns) {
             $avgRating = round((float) ($tech->avg_rating ?? 0), 1);
             $reviewCount = (int) ($tech->review_count ?? 0);
+            $distanceKm = round((float) ($tech->distance_km ?? 0), 2);
 
             $filteredCategoryId = $request->filled('service_category_id')
                 ? (int) $request->service_category_id
@@ -410,16 +658,6 @@ class TechnicianController extends Controller
                 ? ($tech->serviceCategories->firstWhere('id', $filteredCategoryId)
                     ?? $tech->serviceCategories->first())
                 : $tech->serviceCategories->first();
-
-            $distanceKm = null;
-            if ($customerLat !== null && $customerLng !== null && $tech->latitude && $tech->longitude) {
-                $distanceKm = $this->distanceKm(
-                    $customerLat,
-                    $customerLng,
-                    (float) $tech->latitude,
-                    (float) $tech->longitude
-                );
-            }
 
             $currentlyAvailable = Schema::hasColumn('users', 'currently_available')
                 ? (bool) ($tech->currently_available ?? true)
@@ -446,8 +684,10 @@ class TechnicianController extends Controller
                     'name' => $cat->name,
                 ])->values(),
                 'experience' => $tech->experience,
+                'latitude' => $tech->latitude !== null ? (float) $tech->latitude : null,
+                'longitude' => $tech->longitude !== null ? (float) $tech->longitude : null,
                 'distance_km' => $distanceKm,
-                'distance_text' => $distanceKm !== null ? $distanceKm . ' km away' : null,
+                'distance_text' => $distanceKm . ' km away',
                 'currently_available' => $currentlyAvailable,
                 'availability_status' => $this->resolveAvailabilityStatus($currentlyAvailable),
                 'is_featured' => $isFeatured,
@@ -461,10 +701,6 @@ class TechnicianController extends Controller
                 ],
             ];
         });
-
-        // #region agent log
-        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-FEAT', 'location' => 'TechnicianController::getTechnicians', 'message' => 'featured flags computed', 'data' => ['total' => $mapped->count(), 'featured_count' => $mapped->where('is_featured', true)->count(), 'filter' => $filter, 'sample' => $mapped->take(3)->map(fn ($t) => ['id' => $t['id'], 'is_featured' => $t['is_featured'], 'plan' => $t['subscription']['plan_type'] ?? null])->values()], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
-        // #endregion
 
         if ($filter === 'featured') {
             $mapped = $mapped->filter(fn ($t) => $t['is_featured'])->values();
@@ -500,13 +736,7 @@ class TechnicianController extends Controller
                 ->values();
         }
 
-        if ($filter === 'nearest') {
-            $mapped = $mapped->filter(fn ($t) => $t['distance_km'] !== null && $t['distance_km'] <= $radiusKm)
-                ->sortBy(fn ($t) => $t['distance_km'])
-                ->values();
-        }
-
-        $sortBy = $request->input('sort_by');
+        $sortBy = $request->input('sort_by', $filter === 'nearest' || !$request->filled('sort_by') ? 'distance' : null);
         if ($sortBy === 'rating') {
             $mapped = $mapped->sort(function ($a, $b) use ($ratingBreakdowns) {
                 $score = function ($tech) use ($ratingBreakdowns) {
@@ -533,12 +763,9 @@ class TechnicianController extends Controller
 
                 return 0;
             })->values();
-        } elseif ($sortBy === 'distance' && $customerLat !== null) {
-            $mapped = $mapped->sortBy(fn ($t) => $t['distance_km'] ?? 999999)->values();
         } elseif ($sortBy === 'name') {
             $mapped = $mapped->sortBy('name')->values();
-        } elseif ($sortBy === 'featured' || (!$sortBy && in_array($filter, ['all', 'featured'], true))) {
-            // Featured / priority search plans float to the top for home + search lists.
+        } elseif ($sortBy === 'featured') {
             $mapped = $mapped->sort(function ($a, $b) {
                 $aPriority = ($a['is_featured'] ? 2 : 0)
                     + (in_array('priority_search_placement', $a['subscription']['feature_keys'] ?? [], true) ? 1 : 0);
@@ -546,44 +773,74 @@ class TechnicianController extends Controller
                     + (in_array('priority_search_placement', $b['subscription']['feature_keys'] ?? [], true) ? 1 : 0);
 
                 if ($aPriority === $bPriority) {
-                    return $b['rating'] <=> $a['rating'];
+                    return $a['distance_km'] <=> $b['distance_km'];
                 }
 
                 return $bPriority <=> $aPriority;
             })->values();
+        } else {
+            // Default / nearest: nearest distance first
+            $mapped = $mapped->sortBy('distance_km')->values();
+            $sortBy = 'distance';
         }
 
-        $categoryFilter = $request->input('service_category_id') ?? $request->input('category', 'all');
+        $total = $mapped->count();
         $featuredList = $mapped->filter(fn ($t) => $t['is_featured'])->values();
+        $categoryFilter = $request->input('service_category_id') ?? $request->input('category', 'all');
+
+        // Pagination is optional. Without per_page, return the full eligible set.
+        $paginate = $request->filled('per_page') || $request->filled('page');
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = $paginate
+            ? min(100, max(1, (int) $request->input('per_page', 20)))
+            : max($total, 1);
+        $lastPage = max(1, (int) ceil(($total ?: 1) / $perPage));
+        $pageItems = $paginate
+            ? $mapped->slice(($page - 1) * $perPage, $perPage)->values()
+            : $mapped->values();
 
         return response()->json([
-            'success' => 200,
+            'success' => true,
+            'message' => $total === 0
+                ? ($search !== ''
+                    ? 'No technicians found for "' . $search . '" within ' . $radiusKm . ' km.'
+                    : 'No technicians found within ' . $radiusKm . ' km.')
+                : 'Technicians retrieved successfully.',
             'filter' => $filter,
-            'sort_by' => $sortBy ?? 'featured',
+            'sort_by' => $sortBy,
+            'search' => $search !== '' ? $search : null,
             'service_category_id' => $categoryFilter,
-            'google_maps' => [
-                'customer_latitude' => $customerLat,
-                'customer_longitude' => $customerLng,
+            'location' => [
+                'latitude' => $customerLat,
+                'longitude' => $customerLng,
+                'source' => $locationSource,
                 'radius_km' => $radiusKm,
-                'integration_status' => 'structure_ready',
-                'distance_note' => 'distance_km is null until customer lat/lng and technician coordinates are set',
+                'distance_formula' => 'haversine',
+                'includes_boundary' => true,
+            ],
+            'radius_check' => [
+                'radius_km' => $radiusKm,
+                'max_distance_in_results' => $total > 0 ? $mapped->max('distance_km') : null,
+                'all_within_radius' => $mapped->every(fn ($t) => $t['distance_km'] <= $radiusKm),
+                'excluded_missing_coords' => true,
             ],
             'featured_total' => $featuredList->count(),
             'featured' => $featuredList,
-            'total' => $mapped->count(),
-            'data' => $mapped,
+            'pagination' => [
+                'current_page' => $page,
+                'per_page' => $paginate ? $perPage : $total,
+                'total' => $total,
+                'last_page' => $paginate ? $lastPage : 1,
+                'paginated' => $paginate,
+            ],
+            'total' => $total,
+            'data' => $pageItems,
         ]);
     }
 
     private function distanceKm(float $lat1, float $lon1, float $lat2, float $lon2): float
     {
-        $earthRadius = 6371;
-        $dLat = deg2rad($lat2 - $lat1);
-        $dLon = deg2rad($lon2 - $lon1);
-        $a = sin($dLat / 2) ** 2
-            + cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * sin($dLon / 2) ** 2;
-
-        return round($earthRadius * 2 * atan2(sqrt($a), sqrt(1 - $a)), 1);
+        return round((float) GeoDistance::haversineKm($lat1, $lon1, $lat2, $lon2), 1);
     }
 
     private function resolveAvailabilityStatus(bool $currentlyAvailable): string
@@ -600,6 +857,56 @@ class TechnicianController extends Controller
             $rating > 0 => 'Fair',
             default => 'New',
         };
+    }
+
+    public function subscriptionOrderSummary(Request $request, $subscriptionId = null)
+    {
+        $id = $subscriptionId ?: $request->input('subscription_id');
+
+        if (!$id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'subscription_id is required.',
+                'toast_message' => 'Please select a subscription plan to continue.',
+            ], 422);
+        }
+
+        $subscription = \App\Models\Subscription::query()
+            ->where('id', $id)
+            ->where('is_active', true)
+            ->first();
+
+        if (!$subscription) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Subscription plan not found.',
+                'toast_message' => 'The selected subscription plan is unavailable. Please choose another plan.',
+            ], 404);
+        }
+
+        $summary = $subscription->toOrderSummaryArray();
+        $planName = $summary['name'] ?? ($subscription->name ?: $subscription->plan_type_label);
+        $message = 'Order summary for ' . $planName . ' is ready. Please review the pricing and proceed to payment.';
+        $canPurchase = true;
+        $user = $request->user('sanctum') ?? auth('sanctum')->user();
+
+        if ($user && $user->user_type === 'technician' && $user->hasUnexpiredPlan((int) $subscription->id)) {
+            $canPurchase = false;
+            $expiry = $user->subscription_end
+                ? \Illuminate\Support\Carbon::parse($user->subscription_end)->format('d M Y')
+                : null;
+            $message = 'You already have an active ' . $planName . ' plan'
+                . ($expiry ? ' until ' . $expiry : '')
+                . '. You cannot purchase this plan again until it expires. You can upgrade to a different plan.';
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => $message,
+            'toast_message' => $message,
+            'can_purchase' => $canPurchase,
+            'data' => $summary,
+        ]);
     }
 
     public function getSubscriptions()
@@ -662,19 +969,19 @@ class TechnicianController extends Controller
         }
     }
 
-    public function getTechnicianProfile($technicianId)
+    public function getTechnicianProfile(Request $request, $technicianId)
     {
         $technician = User::query()
             ->where('id', $technicianId)
             ->where('user_type', 'technician')
-            ->where('status', 'active')
+            ->whereAccountActivated()
             ->with(['serviceCategories', 'availabilities', 'workGalleries'])
             ->first();
 
         if (!$technician) {
             return response()->json([
                 'success' => false,
-                'message' => 'Technician not found.',
+                'message' => 'Technician not found or account not activated.',
             ], 404);
         }
 
@@ -716,6 +1023,16 @@ class TechnicianController extends Controller
 
         $galleryTotal = $galleryItems->count();
 
+        $authUser = $this->resolveSanctumUser($request);
+        [$originLat, $originLng] = UserLocation::resolve($request, $authUser, (bool) $authUser);
+        $distanceKm = GeoDistance::haversineKm(
+            $originLat,
+            $originLng,
+            $technician->latitude !== null ? (float) $technician->latitude : null,
+            $technician->longitude !== null ? (float) $technician->longitude : null
+        );
+        $distanceKm = $distanceKm !== null ? round($distanceKm, 2) : null;
+
         // #region agent log
         @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H3', 'location' => 'TechnicianController::getTechnicianProfile', 'message' => 'profile work gallery', 'data' => ['technician_id' => $technician->id, 'total' => $galleryTotal, 'sample' => $galleryItems->take(2)->values()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
         // #endregion
@@ -726,6 +1043,8 @@ class TechnicianController extends Controller
                 'id' => $technician->id,
                 'name' => $technician->name,
                 'photo' => $technician->photo ? asset($technician->photo) : null,
+                'distance_km' => $distanceKm,
+                'distance_text' => $distanceKm !== null ? $distanceKm . ' km away' : null,
                 'bio' => $technician->bio,
                 'experience' => $technician->experience,
                 'service_category' => $primaryCategory ? [
@@ -942,5 +1261,297 @@ public function getServiceCategory()
         'data' => $data,
     ]);
 }
+
+    // GET /api/technician/profile — My Profile screen data
+    public function myProfile(Request $request)
+    {
+        $user = $request->user();
+
+        if ($user->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can access this profile.',
+            ], 403);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Technician profile retrieved successfully.',
+            'data' => $this->technicianMyProfilePayload($user),
+        ]);
+    }
+
+    // POST /api/technician/profile/update — update only My Profile screen inputs
+    public function updateMyProfile(Request $request)
+    {
+        $user = $request->user();
+
+        if ($user->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can update this profile.',
+            ], 403);
+        }
+
+        foreach (['skills', 'service_area', 'availability', 'certificates'] as $jsonField) {
+            if ($request->has($jsonField) && is_string($request->input($jsonField))) {
+                $decoded = json_decode($request->input($jsonField), true);
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    $request->merge([$jsonField => $decoded]);
+                }
+            }
+        }
+
+        $request->validate([
+            'name' => 'nullable|string|max:255',
+            'phone' => 'nullable|string|max:50',
+            'district_id' => 'nullable|exists:districts,id',
+            'bio' => 'nullable|string',
+            'experience' => 'nullable|string|max:255',
+            'skills' => 'nullable|array',
+            'skills.*' => 'nullable|string|max:100',
+            'service_area' => 'nullable',
+            'availability' => 'nullable|array',
+            'availability.*.day' => 'required_with:availability|in:monday,tuesday,wednesday,thursday,friday,saturday,sunday',
+            'availability.*.is_available' => 'nullable|boolean',
+            'availability.*.start' => 'nullable|date_format:H:i',
+            'availability.*.end' => 'nullable|date_format:H:i',
+            'availability.*.start_time' => 'nullable|date_format:H:i',
+            'availability.*.end_time' => 'nullable|date_format:H:i',
+            'photo' => 'nullable|file|mimes:jpg,jpeg,png|max:5120',
+            'cnic_front' => 'nullable|file|mimes:jpg,jpeg,png,pdf|max:5120',
+            'cnic_back' => 'nullable|file|mimes:jpg,jpeg,png,pdf|max:5120',
+            'certificates' => 'nullable',
+            'certificates.*' => 'nullable|file|mimes:jpg,jpeg,png,pdf|max:5120',
+        ]);
+
+        $data = [];
+
+        if ($request->filled('name')) {
+            $data['name'] = $request->name;
+        }
+        if ($request->has('phone')) {
+            $data['phone'] = $request->phone;
+        }
+        if ($request->filled('district_id')) {
+            $data['district_id'] = (int) $request->district_id;
+        }
+        if ($request->has('bio')) {
+            $data['bio'] = $request->bio;
+        }
+        if ($request->has('experience')) {
+            $data['experience'] = $request->experience;
+        }
+        if ($request->has('skills')) {
+            $data['skills'] = array_values(array_filter((array) $request->skills, fn ($s) => trim((string) $s) !== ''));
+        }
+        if ($request->has('service_area')) {
+            $serviceArea = $request->input('service_area');
+            if (is_string($serviceArea)) {
+                $serviceArea = trim($serviceArea) === '' ? [] : [$serviceArea];
+            }
+            $data['service_area'] = is_array($serviceArea) ? array_values($serviceArea) : [];
+        }
+
+        $uploadPath = public_path('backend/img');
+        if (!is_dir($uploadPath)) {
+            mkdir($uploadPath, 0777, true);
+        }
+
+        if ($request->hasFile('photo')) {
+            $data['photo'] = $this->storeTechnicianDocument($request->file('photo'), 'profile_');
+            $data['photo_verified'] = false;
+        }
+        if ($request->hasFile('cnic_front')) {
+            $data['cnic_front'] = $this->storeTechnicianDocument($request->file('cnic_front'), 'cnic_front_');
+            $data['cnic_front_verified'] = false;
+        }
+        if ($request->hasFile('cnic_back')) {
+            $data['cnic_back'] = $this->storeTechnicianDocument($request->file('cnic_back'), 'cnic_back_');
+            $data['cnic_back_verified'] = false;
+        }
+
+        if ($request->hasFile('certificates')) {
+            $certs = $request->file('certificates');
+            if (!is_array($certs)) {
+                $certs = [$certs];
+            }
+            $saved = [];
+            foreach ($certs as $file) {
+                if ($file && $file->isValid()) {
+                    $saved[] = $this->storeTechnicianDocument($file, 'cert_');
+                }
+            }
+            if ($saved !== []) {
+                $data['certificates'] = $saved;
+                $data['certificates_verified'] = false;
+            }
+        }
+
+        if ($data !== []) {
+            $user->update($data);
+        }
+
+        if ($request->has('availability') && is_array($request->availability)) {
+            foreach ($request->availability as $schedule) {
+                $day = strtolower((string) ($schedule['day'] ?? ''));
+                if ($day === '') {
+                    continue;
+                }
+
+                TechnicianAvailability::updateOrCreate(
+                    [
+                        'technician_id' => $user->id,
+                        'day' => $day,
+                        'specific_date' => $schedule['specific_date'] ?? null,
+                    ],
+                    [
+                        'start_time' => $schedule['start'] ?? $schedule['start_time'] ?? null,
+                        'end_time' => $schedule['end'] ?? $schedule['end_time'] ?? null,
+                        'is_available' => array_key_exists('is_available', $schedule)
+                            ? filter_var($schedule['is_available'], FILTER_VALIDATE_BOOLEAN)
+                            : true,
+                    ]
+                );
+            }
+        }
+
+        $user = $user->fresh(['district', 'availabilities']);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Profile updated successfully.',
+            'data' => $this->technicianMyProfilePayload($user),
+        ]);
+    }
+
+    private function storeTechnicianDocument($file, string $prefix): string
+    {
+        $uploadPath = public_path('backend/img');
+        if (!is_dir($uploadPath)) {
+            mkdir($uploadPath, 0777, true);
+        }
+
+        $filename = $prefix . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
+        $file->move($uploadPath, $filename);
+
+        return 'backend/img/' . $filename;
+    }
+
+    private function technicianMyProfilePayload(User $user): array
+    {
+        $user->loadMissing(['district', 'availabilities']);
+
+        $ratingStats = TechnicianReview::where('technician_id', $user->id)
+            ->where('is_approved', true)
+            ->selectRaw('AVG(rating) as avg_rating, COUNT(*) as review_count')
+            ->first();
+
+        $avgRating = round((float) ($ratingStats->avg_rating ?? 0), 1);
+        $reviewCount = (int) ($ratingStats->review_count ?? 0);
+
+        $skills = $user->skills;
+        if (is_string($skills)) {
+            $skills = json_decode($skills, true) ?? [];
+        }
+        $skills = is_array($skills) ? array_values($skills) : [];
+
+        $serviceArea = $user->service_area;
+        if (is_string($serviceArea)) {
+            $decoded = json_decode($serviceArea, true);
+            $serviceArea = json_last_error() === JSON_ERROR_NONE ? $decoded : [$serviceArea];
+        }
+        $serviceArea = is_array($serviceArea) ? array_values($serviceArea) : [];
+        $serviceAreaLabel = $serviceArea !== [] ? implode(', ', $serviceArea) : null;
+
+        $certificates = $user->certificates;
+        if (is_string($certificates)) {
+            $certificates = json_decode($certificates, true) ?? [];
+        }
+        $certificates = is_array($certificates) ? array_values($certificates) : [];
+
+        $days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+        $availabilityByDay = $user->availabilities->keyBy(fn ($row) => strtolower((string) $row->day));
+        $availability = collect($days)->map(function ($day) use ($availabilityByDay) {
+            $row = $availabilityByDay->get($day);
+            $isAvailable = $row ? (bool) $row->is_available : false;
+
+            return [
+                'day' => $day,
+                'day_label' => ucfirst($day),
+                'is_available' => $isAvailable,
+                'status_label' => $isAvailable ? 'Available' : 'Day Off',
+                'start_time' => $row->start_time ?? null,
+                'end_time' => $row->end_time ?? null,
+            ];
+        })->values();
+
+        $status = strtolower((string) ($user->status ?? 'pending'));
+        $statusLabels = [
+            'pending' => 'Account Pending Activation',
+            'review' => 'Account Under Review',
+            'active' => 'Account Active',
+            'inactive' => 'Account Inactive',
+            'rejected' => 'Account Rejected',
+        ];
+
+        $docStatus = function (bool $verified): string {
+            return $verified ? 'Verified' : 'Pending';
+        };
+
+        return [
+            'id' => $user->id,
+            'name' => $user->name,
+            'email' => $user->email,
+            'photo' => $user->photo ? asset($user->photo) : null,
+            'account_status' => $user->status,
+            'account_status_label' => $statusLabels[$status] ?? ucfirst((string) $user->status),
+            'stats' => [
+                'rating' => $avgRating,
+                'reviews' => $reviewCount,
+                'experience' => $user->experience ?: null,
+            ],
+            'personal_info' => [
+                'name' => $user->name,
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'district_id' => $user->district_id,
+                'district' => $user->district->name ?? null,
+                'member_since' => $user->memberSince(),
+            ],
+            'availability' => $availability,
+            'bio' => $user->bio,
+            'skills' => $skills,
+            'service_area' => $serviceArea,
+            'service_area_label' => $serviceAreaLabel,
+            'experience' => $user->experience,
+            'documents' => [
+                'photo' => [
+                    'uploaded' => !empty($user->photo),
+                    'url' => $user->photo ? asset($user->photo) : null,
+                    'status' => $docStatus((bool) $user->photo_verified),
+                    'verified' => (bool) $user->photo_verified,
+                ],
+                'cnic_front' => [
+                    'uploaded' => !empty($user->cnic_front),
+                    'url' => $user->cnic_front ? asset($user->cnic_front) : null,
+                    'status' => $docStatus((bool) $user->cnic_front_verified),
+                    'verified' => (bool) $user->cnic_front_verified,
+                ],
+                'cnic_back' => [
+                    'uploaded' => !empty($user->cnic_back),
+                    'url' => $user->cnic_back ? asset($user->cnic_back) : null,
+                    'status' => $docStatus((bool) $user->cnic_back_verified),
+                    'verified' => (bool) $user->cnic_back_verified,
+                ],
+                'certificates' => [
+                    'uploaded' => $certificates !== [],
+                    'urls' => array_map(fn ($path) => asset($path), $certificates),
+                    'status' => $docStatus((bool) $user->certificates_verified),
+                    'verified' => (bool) $user->certificates_verified,
+                ],
+            ],
+        ];
+    }
 
 }

@@ -10,14 +10,14 @@ use App\Models\District;
 use App\Models\ServiceCategory;
 use App\Models\User;
 use App\Services\BroadcastRadiusService;
+use App\Services\GoogleDistanceService;
 use App\Support\BookingReference;
+use App\Support\UserLocation;
 use App\Traits\GlobalMailTrait;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 
 class BookingController extends Controller
@@ -426,7 +426,7 @@ class BookingController extends Controller
     {
         $query = User::query()
             ->where('user_type', 'technician')
-            ->where('status', 'active')
+            ->whereAccountActivated()
             ->where('is_verified', true)
             ->whereHas('serviceCategories', function ($q) use ($serviceCategoryId) {
                 $q->where('service_categories.id', $serviceCategoryId);
@@ -445,6 +445,10 @@ class BookingController extends Controller
 
     private function technicianCanViewBroadcast(User $technician, Booking $booking): bool
     {
+        if (!$technician->isAccountActivated()) {
+            return false;
+        }
+
         if (!$booking->isBroadcast() || $booking->status !== 'pending' || $booking->technician_id) {
             return false;
         }
@@ -715,11 +719,11 @@ class BookingController extends Controller
 
         $technician = User::where('id', $request->technician_id)
             ->where('user_type', 'technician')
-            ->where('status', 'active')
+            ->whereAccountActivated()
             ->first();
 
         if (!$technician) {
-            return response()->json(['error' => 'Technician not found'], 404);
+            return response()->json(['error' => 'Technician not found or account not activated'], 404);
         }
 
         $remainingIds = $radiusService->remainingTechnicians($booking)->pluck('id')->map(fn ($id) => (int) $id)->all();
@@ -898,16 +902,21 @@ class BookingController extends Controller
             'emergency_level' => 'nullable|string',
             'service_category_id' => 'nullable|integer|exists:service_categories,id',
             'category_id' => 'nullable|integer|exists:service_categories,id',
+            'latitude' => 'nullable|numeric|between:-90,90',
+            'longitude' => 'nullable|numeric|between:-180,180',
+            'lat' => 'nullable|numeric|between:-90,90',
+            'lng' => 'nullable|numeric|between:-180,180',
+            'long' => 'nullable|numeric|between:-180,180',
         ]);
 
         $customer = $request->user();
         $technician = User::where('id', $request->technician_id)
                          ->where('user_type', 'technician')
-                         ->where('status', 'active')
+                         ->whereAccountActivated()
                          ->first();
 
         if (!$technician) {
-            return response()->json(['error' => 'Technician not found or not active'], 404);
+            return response()->json(['error' => 'Technician not found or account not activated'], 404);
         }
 
         $emergency = strtolower(trim((string) ($request->emergency_level ?: 'low')));
@@ -981,7 +990,15 @@ class BookingController extends Controller
                 ?? $this->matchServiceCategoryFromText($request->service_category)?->id;
         }
 
-        $booking = Booking::create([
+        [$latitude, $longitude] = UserLocation::coordinatesFromRequest($request);
+        if ($latitude !== null && $longitude !== null) {
+            UserLocation::save($customer, $latitude, $longitude);
+        } else {
+            $latitude = $customer->latitude !== null ? (float) $customer->latitude : null;
+            $longitude = $customer->longitude !== null ? (float) $customer->longitude : null;
+        }
+
+        $bookingPayload = [
             'customer_id' => $customer->id,
             'technician_id' => $technician->id,
             'booking_type' => 'direct',
@@ -998,10 +1015,18 @@ class BookingController extends Controller
             'additional_notes' => $request->additional_notes,
             'booking_reference' => null,
             'expires_at' => Carbon::now()->addMinutes($expiryMinutes),
-        ]);
+        ];
 
-        // Send notification to technician (via push, sms, or email)
-        $this->notifyTechnician($technician, $booking);
+        if ($latitude !== null && $longitude !== null && Schema::hasColumn('bookings', 'latitude')) {
+            $bookingPayload['latitude'] = $latitude;
+            $bookingPayload['longitude'] = $longitude;
+        }
+
+        $booking = Booking::create($bookingPayload);
+        $booking->load(['customer', 'technician', 'serviceCategory']);
+
+        $this->notifyTechnician($technician, $booking, 'new');
+        $this->notifyCustomer($booking->customer, $booking, 'request_sent');
 
         return response()->json([
             'success' => true,
@@ -1073,6 +1098,28 @@ class BookingController extends Controller
             ], 403);
         }
 
+        if (!$technician->isAccountActivated()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Activate your account to receive booking requests.',
+                'filter' => 'all',
+                'filters' => ['all' => 0, 'now' => 0, 'later' => 0, 'emergency' => 0],
+                'new_count' => 0,
+                'badge_count' => 0,
+                'is_account_active' => false,
+                'data' => [
+                    'current_page' => 1,
+                    'per_page' => $this->technicianHomePerPage($request),
+                    'total' => 0,
+                    'last_page' => 1,
+                    'requests' => [],
+                ],
+            ]);
+        }
+
+        UserLocation::saveFromRequest($technician, $request);
+        $technician->refresh();
+
         app(BroadcastRadiusService::class)->ensureTables();
 
         $filter = strtolower(trim((string) ($request->input('filter') ?? $request->input('type') ?? 'all')));
@@ -1115,6 +1162,12 @@ class BookingController extends Controller
             'filters' => $filterCounts,
             'new_count' => $filterCounts['all'],
             'badge_count' => $filterCounts['emergency'] + $filterCounts['now'],
+            'google_maps' => [
+                'technician_latitude' => $technician->latitude !== null ? (float) $technician->latitude : null,
+                'technician_longitude' => $technician->longitude !== null ? (float) $technician->longitude : null,
+                'integration_status' => app(GoogleDistanceService::class)->hasApiKey() ? 'live' : 'haversine_fallback',
+                'distance_source' => app(GoogleDistanceService::class)->hasApiKey() ? 'google_distance_matrix' : 'haversine',
+            ],
             'data' => [
                 'current_page' => $bookings->currentPage(),
                 'per_page' => $bookings->perPage(),
@@ -1134,6 +1187,15 @@ class BookingController extends Controller
                 'success' => false,
                 'message' => 'Only technicians can view broadcast emergency requests.',
             ], 403);
+        }
+
+        if (!$technician->isAccountActivated()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Activate your account to receive booking requests.',
+                'is_account_active' => false,
+                'data' => [],
+            ]);
         }
 
         app(BroadcastRadiusService::class)->ensureTables();
@@ -1796,40 +1858,7 @@ private function applyPendingRequestTypeFilter($query, string $filter)
 
 private function googleMapsDistanceKm($lat1, $lon1, $lat2, $lon2): ?float
 {
-    $fallback = $this->calculateDistance($lat1, $lon1, $lat2, $lon2);
-    $key = config('services.google_maps.key');
-
-    if (!$key || $fallback === null) {
-        return $fallback;
-    }
-
-    $cacheKey = 'gmaps_dist_' . implode('_', [
-        round((float) $lat1, 5),
-        round((float) $lon1, 5),
-        round((float) $lat2, 5),
-        round((float) $lon2, 5),
-    ]);
-
-    try {
-        $meters = Cache::remember($cacheKey, 600, function () use ($key, $lat1, $lon1, $lat2, $lon2) {
-            $response = Http::timeout(8)->get('https://maps.googleapis.com/maps/api/distancematrix/json', [
-                'origins' => $lat1 . ',' . $lon1,
-                'destinations' => $lat2 . ',' . $lon2,
-                'units' => 'metric',
-                'key' => $key,
-            ]);
-
-            return $response->json('rows.0.elements.0.distance.value');
-        });
-
-        if ($meters !== null && $meters !== false) {
-            return round(((float) $meters) / 1000, 1);
-        }
-    } catch (\Throwable $e) {
-        // fall back to coordinate distance
-    }
-
-    return $fallback;
+    return app(GoogleDistanceService::class)->distanceKm($lat1, $lon1, $lat2, $lon2);
 }
 
 /**
@@ -1837,20 +1866,7 @@ private function googleMapsDistanceKm($lat1, $lon1, $lat2, $lon2): ?float
  */
 private function calculateDistance($lat1, $lon1, $lat2, $lon2)
 {
-    if (empty($lat1) || empty($lon1) || empty($lat2) || empty($lon2)) {
-        return null;
-    }
-
-    $earthRadius = 6371; // kilometers
-    $dLat = deg2rad($lat2 - $lat1);
-    $dLon = deg2rad($lon2 - $lon1);
-    $a = sin($dLat / 2) * sin($dLat / 2) + 
-         cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * 
-         sin($dLon / 2) * sin($dLon / 2);
-    $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
-    $distance = $earthRadius * $c;
-
-    return round($distance, 2);
+    return app(GoogleDistanceService::class)->distanceKm($lat1, $lon1, $lat2, $lon2);
 }
 
 /**
@@ -1957,6 +1973,13 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
 
         if ($technician->user_type !== 'technician') {
             return response()->json(['error' => 'Only technicians can accept bookings'], 403);
+        }
+
+        if (!$technician->isAccountActivated()) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Activate your account with a subscription to receive and accept bookings.',
+            ], 403);
         }
 
         app(BroadcastRadiusService::class)->ensureTables();
@@ -2091,21 +2114,7 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
 
         $booking->load(['customer', 'technician', 'serviceCategory', 'district']);
 
-        // Send notification to customer
         $this->notifyCustomer($booking->customer, $booking, 'accepted');
-        if ($booking->isBroadcast() && $booking->customer) {
-            app(BroadcastRadiusService::class)->notifyUser(
-                $booking->customer,
-                'Your request has been accepted',
-                ($booking->technician->name ?? 'Technician') . ' accepted your request.',
-                [
-                    'booking_id' => $booking->id,
-                    'technician_id' => $booking->technician_id,
-                    'type' => 'broadcast_accepted',
-                ],
-                'broadcast_accepted'
-            );
-        }
 
         // #region agent log
         @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'E', 'location' => 'BookingController::acceptBooking', 'message' => 'broadcast locked by technician accept', 'data' => ['booking_id' => $booking->id, 'technician_id' => $booking->technician_id, 'is_broadcast' => $booking->isBroadcast()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
@@ -2519,6 +2528,7 @@ private function transformAcceptedBooking($booking)
         ]);
 
         $this->notifyCustomer($booking->customer, $booking, 'completed');
+        $this->notifyTechnician($technician, $booking, 'completed');
 
         return response()->json([
             'success' => true,
@@ -3067,15 +3077,148 @@ private function transformAcceptedBooking($booking)
     // Helper: Notify technician (simplified - you can add real notifications)
     private function notifyTechnician($technician, $booking, $type = 'new')
     {
-        // TODO: Implement real notifications (Firebase, OneSignal, SMS, Email)
-        // For now, just log or send email
-        \Log::info("Notification to {$technician->email}: New booking request #{$booking->booking_reference}");
+        if (!$technician) {
+            return;
+        }
+
+        $booking->loadMissing(['customer', 'serviceCategory']);
+        $customerName = $booking->customer->name ?? 'A customer';
+        $service = $this->resolveJobServiceCategoryName($booking);
+        $scheduled = $this->formatScheduledLabel($booking);
+
+        [$title, $body, $notificationType, $open] = match ($type) {
+            'cancelled' => [
+                'Booking Cancelled',
+                $customerName . ' cancelled the booking for ' . $service . '.',
+                'booking_cancelled',
+                'booking_history',
+            ],
+            'completed' => [
+                'Job Completed Successfully',
+                'Payment will be processed within 24 hours.',
+                'job_completed',
+                'booking_history',
+            ],
+            default => [
+                'New Booking Request',
+                'You received a booking request from ' . $customerName
+                    . ' for ' . $service
+                    . ($scheduled ? ' · ' . $scheduled : '') . '.',
+                'booking_request',
+                'pending_requests',
+            ],
+        };
+
+        app(BroadcastRadiusService::class)->notifyUser(
+            $technician,
+            $title,
+            $body,
+            [
+                'booking_id' => $booking->id,
+                'request_id' => $booking->booking_reference,
+                'type' => $notificationType,
+                'open' => $open,
+            ],
+            $notificationType
+        );
     }
 
-    // Helper: Notify customer
     private function notifyCustomer($customer, $booking, $status)
     {
-        \Log::info("Notification to {$customer->email}: Booking #{$booking->booking_reference} is {$status}");
+        if (!$customer) {
+            return;
+        }
+
+        $booking->loadMissing(['technician', 'serviceCategory']);
+        $techName = $booking->technician->name ?? 'Technician';
+        $service = $this->resolveJobServiceCategoryName($booking);
+        $notifier = app(BroadcastRadiusService::class);
+
+        $payload = match ($status) {
+            'request_sent' => [
+                'title' => 'Booking Request Sent',
+                'body' => 'Your booking request has been sent to ' . $techName . '. You will receive a confirmation shortly.',
+                'type' => 'booking_request_sent',
+            ],
+            'accepted' => [
+                'title' => 'Booking Confirmed',
+                'body' => 'Your booking is confirmed by ' . $techName . '.',
+                'type' => 'booking_confirmed',
+            ],
+            'on_the_way' => [
+                'title' => 'Technician On the Way',
+                'body' => $techName . ' is on the way to your location.',
+                'type' => 'technician_on_the_way',
+            ],
+            'work_started' => [
+                'title' => 'Work Started',
+                'body' => $techName . ' has started your ' . $service . ' service.',
+                'type' => 'work_started',
+            ],
+            'work_in_progress' => [
+                'title' => 'Work In Progress',
+                'body' => 'Your ' . $service . ' service is currently in progress.',
+                'type' => 'work_in_progress',
+            ],
+            'completion_otp' => [
+                'title' => 'Verify Job Completion',
+                'body' => $techName . ' is completing your ' . $service . '. Check your email for the 6-digit completion code.',
+                'type' => 'completion_code',
+            ],
+            'completed' => [
+                'title' => 'Service Completed',
+                'body' => 'Your ' . $service . ' service is complete. Rate your experience!',
+                'type' => 'service_completed',
+            ],
+            'rejected' => [
+                'title' => 'Booking Update',
+                'body' => $techName . ' is unavailable for your ' . $service . ' request.',
+                'type' => 'booking_rejected',
+            ],
+            default => [
+                'title' => 'Booking Update',
+                'body' => 'Your booking for ' . $service . ' is now ' . str_replace('_', ' ', (string) $status) . '.',
+                'type' => 'booking_update',
+            ],
+        };
+
+        $open = match ($status) {
+            'completed' => 'rate_technician',
+            'request_sent' => 'booking_status',
+            'completion_otp' => 'completion_code',
+            default => 'booking_status',
+        };
+
+        $notifier->notifyUser(
+            $customer,
+            $payload['title'],
+            $payload['body'],
+            [
+                'booking_id' => $booking->id,
+                'technician_id' => $booking->technician_id,
+                'technician_name' => $techName,
+                'status' => $status,
+                'type' => $payload['type'],
+                'open' => $open,
+            ],
+            $payload['type']
+        );
+
+        if ($status === 'completed') {
+            $notifier->notifyUser(
+                $customer,
+                "Don't Forget to Rate!",
+                'How was your ' . $service . ' service with ' . $techName . '?',
+                [
+                    'booking_id' => $booking->id,
+                    'technician_id' => $booking->technician_id,
+                    'technician_name' => $techName,
+                    'type' => 'rate_reminder',
+                    'open' => 'rate_technician',
+                ],
+                'rate_reminder'
+            );
+        }
     }
 
     private function requestCompletionOtp(Booking $booking, User $technician): array
@@ -3099,6 +3242,7 @@ private function transformAcceptedBooking($booking)
             ]);
 
             $this->notifyCustomer($customer, $booking, 'completed');
+            $this->notifyTechnician($technician, $booking, 'completed');
 
             return [
                 'success' => true,
@@ -3132,6 +3276,8 @@ private function transformAcceptedBooking($booking)
         }
 
         if ($emailError) {
+            $this->notifyCustomer($customer, $booking, 'completion_otp');
+
             return [
                 'success' => false,
                 'message' => 'OTP generated but email failed to send.',
@@ -3140,6 +3286,8 @@ private function transformAcceptedBooking($booking)
                 'otp_sent' => true,
             ];
         }
+
+        $this->notifyCustomer($customer, $booking, 'completion_otp');
 
         return [
             'success' => true,

@@ -95,11 +95,7 @@
                 </div>
 
                 <ul class="navbar-nav">
-                    <!-- @include('admin.partials.notifications', [
-                        'adminNotifications' => Cache::get('admin-notifications', collect([])),
-                    ])-->
-
-                    
+                    @include('admin.partials.subscription-payment-notifications')
 
                     <li class="dropdown"><a class="nav-link dropdown-toggle nav-link-lg nav-link-user dropdown_user"
                             data-bs-toggle="dropdown" href="javascript:;">

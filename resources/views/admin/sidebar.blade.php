@@ -239,6 +239,13 @@
                             <span>{{ __('Subscriptions') }}</span>
                         </a>
                     </li>
+                    <li class="{{ request()->routeIs('admin.subscription-payments.*') ? 'active' : '' }}">
+                        <a href="{{ route('admin.subscription-payments.index') }}">
+                            <i class="fas fa-credit-card"></i>
+                            <span>{{ __('Subscription Payments') }}</span>
+                            <span class="badge badge-danger badge-pending ms-1 d-none" id="sidebarPaymentUnreadBadge">0</span>
+                        </a>
+                    </li>
                     @endcan
                     @can('service.categories.view')
                     <li class="{{ request()->routeIs('admin.service-categories.*') ? 'active' : '' }}">

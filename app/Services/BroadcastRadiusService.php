@@ -114,7 +114,7 @@ class BroadcastRadiusService
 
         $query = User::query()
             ->where('user_type', 'technician')
-            ->where('status', 'active')
+            ->whereAccountActivated()
             ->where('is_verified', true)
             ->whereNotNull('latitude')
             ->whereNotNull('longitude')
@@ -310,12 +310,12 @@ class BroadcastRadiusService
                 'push_status' => 'pending',
             ]);
 
-            $sent = $fcm->sendToToken(
-                $technician->fcmtoken ?? null,
-                $title,
-                $body,
-                $notification->data ?? []
-            );
+        $sent = $fcm->sendToToken(
+            $technician->fcmtoken ?? null,
+            $title,
+            $body,
+            array_merge($notification->data ?? [], ['notification_id' => (string) $notification->id])
+        );
             $notification->update(['push_status' => $sent ? 'sent' : 'skipped']);
         }
 
@@ -488,7 +488,12 @@ class BroadcastRadiusService
             'push_status' => 'pending',
         ]);
 
-        $sent = app(FcmPushService::class)->sendToToken($user->fcmtoken ?? null, $title, $body, $data);
+        $sent = app(FcmPushService::class)->sendToToken(
+            $user->fcmtoken ?? null,
+            $title,
+            $body,
+            array_merge($data, ['notification_id' => (string) $notification->id])
+        );
         $notification->update(['push_status' => $sent ? 'sent' : 'skipped']);
         // #region agent log
         @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'D,E', 'location' => 'BroadcastRadiusService::notifyUser', 'message' => 'notification dispatched', 'data' => ['user_id' => $user->id, 'user_type' => $user->user_type, 'type' => $type, 'title' => $title, 'push_status' => $sent ? 'sent' : 'skipped', 'has_fcm' => !empty($user->fcmtoken)], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);

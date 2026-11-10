@@ -214,10 +214,7 @@ class UserController extends Controller
         $wasPending = $user->status !== 'active';
         $column = $request->field . '_verified';
         $user->update([$column => true]);
-
-        if ($user->fresh()->allDocumentsVerified()) {
-            $user->update(['status' => 'active']);
-        }
+        $user->fresh()->syncActivationStatus();
 
         if ($request->expectsJson()) {
             return response()->json([
@@ -248,10 +245,7 @@ class UserController extends Controller
             'payment_status' => 'verified',
             'subscription' => 'active',
         ]);
-
-        if ($user->fresh()->allDocumentsVerified()) {
-            $user->update(['status' => 'active']);
-        }
+        $user->fresh()->syncActivationStatus();
 
         if ($request->expectsJson()) {
             return response()->json([

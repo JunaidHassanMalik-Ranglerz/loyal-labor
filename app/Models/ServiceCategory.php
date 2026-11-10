@@ -45,6 +45,6 @@ class ServiceCategory extends Model
     {
         return $this->technicians()
             ->where('users.user_type', 'technician')
-            ->where('users.status', 'active');
+            ->whereAccountActivated();
     }
 }

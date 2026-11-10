@@ -52,12 +52,18 @@
 
                                     <div class="form-group col-12 col-md-6">
                                         <label>{{ __('Original Price (PKR)') }} <span class="text-danger">*</span></label>
-                                        <input type="number" step="0.01" id="price_pkr" class="form-control" name="price_pkr" value="{{ old('price_pkr', $subscription->price_pkr) }}" placeholder="e.g., 5000" required min="0">
+                                        <input type="number" step="0.01" id="original_price" class="form-control" name="original_price" value="{{ old('original_price', number_format($subscription->resolvedOriginalPrice(), 2, '.', '')) }}" placeholder="e.g., 1000" required min="0.01">
                                     </div>
 
                                     <div class="form-group col-12 col-md-6">
-                                        <label>{{ __('Saving Price (PKR)') }}</label>
-                                        <input type="number" step="0.01" id="saving_price" class="form-control" name="saving_price" value="{{ old('saving_price', $subscription->saving_price) }}" placeholder="e.g., 4000" min="0">
+                                        <label>{{ __('Discount (%)') }} <span class="text-danger">*</span></label>
+                                        <input type="number" step="0.01" id="discount_percentage" class="form-control" name="discount_percentage" value="{{ old('discount_percentage', number_format($subscription->resolvedDiscountPercentage(), 2, '.', '')) }}" placeholder="e.g., 20" required min="0" max="100">
+                                    </div>
+
+                                    <div class="form-group col-12">
+                                        <label>{{ __('Payable Price (PKR)') }}</label>
+                                        <input type="number" step="0.01" id="payable_price" class="form-control" value="{{ old('payable_price', number_format($subscription->resolvedPayablePrice(), 2, '.', '')) }}" placeholder="0.00" readonly>
+                                        <small class="text-muted">{{ __('Automatically calculated from Original Price and Discount (%).') }}</small>
                                     </div>
 
                                     <div class="form-group col-12">
@@ -166,11 +172,23 @@
             });
         }
 
+        function calculatePayablePrice() {
+            const original = parseFloat($('#original_price').val());
+            const discount = parseFloat($('#discount_percentage').val());
+            const safeOriginal = isNaN(original) || original < 0 ? 0 : original;
+            const safeDiscount = isNaN(discount) ? 0 : Math.min(100, Math.max(0, discount));
+            const payable = Math.max(0, safeOriginal - (safeOriginal * safeDiscount / 100));
+            $('#payable_price').val(payable.toFixed(2));
+        }
+
         $('#plan_type').on('change', function() {
             renderFeatures($(this).val());
         });
 
+        $('#original_price, #discount_percentage').on('input change', calculatePayablePrice);
+
         renderFeatures($('#plan_type').val());
+        calculatePayablePrice();
     });
 </script>
 @endpush

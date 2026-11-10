@@ -23,8 +23,16 @@ class SubscriptionController extends Controller
                 ->editColumn('duration_months', function ($plan) {
                     return $plan->duration_label;
                 })
-                ->editColumn('price_pkr', function ($plan) {
-                    return number_format($plan->price_pkr, 2);
+                ->addColumn('original_price_display', function ($plan) {
+                    return 'PKR ' . number_format($plan->resolvedOriginalPrice(), 2);
+                })
+                ->addColumn('discount_display', function ($plan) {
+                    $discount = $plan->resolvedDiscountPercentage();
+
+                    return rtrim(rtrim(number_format($discount, 2, '.', ''), '0'), '.') . '%';
+                })
+                ->addColumn('payable_price_display', function ($plan) {
+                    return 'PKR ' . number_format($plan->resolvedPayablePrice(), 2);
                 })
                 ->addColumn('status_toggle', function ($plan) {
                     if (!checkAdminHasPermission('subscriptions.edit')) {
@@ -85,32 +93,31 @@ class SubscriptionController extends Controller
             'plan_type' => 'required|in:' . implode(',', Subscription::planTypeKeys()),
             'duration_months' => 'required|integer|min:1',
             'duration_unit' => 'required|in:days,months',
-            'price_pkr' => 'required|numeric|min:0',
-            'saving_price' => 'nullable|numeric|min:0',
-            'discount_percent' => 'nullable|integer|min:0|max:100',
-            'tax_percent' => 'nullable|integer|min:0|max:100',
+            'original_price' => 'required|numeric|gt:0',
+            'discount_percentage' => 'required|numeric|min:0|max:100',
             'is_active' => 'required|in:0,1',
         ]);
 
         $planType = $request->plan_type;
         $features = Subscription::featureLabelsForPlanType($planType);
+        $pricing = Subscription::buildPricingPayload(
+            (float) $request->original_price,
+            (float) $request->discount_percentage
+        );
 
         // #region agent log
         @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'sub-duration', 'hypothesisId' => 'H-DUR1', 'location' => 'SubscriptionController::store', 'message' => 'create with duration unit', 'data' => ['plan_type' => $planType, 'duration' => (int) $request->duration_months, 'duration_unit' => $request->duration_unit], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
         // #endregion
 
-        Subscription::create([
+        Subscription::create(array_merge([
             'name' => Subscription::PLAN_TYPES[$planType],
             'plan_type' => $planType,
             'duration_months' => (int) $request->duration_months,
             'duration_unit' => $request->duration_unit,
-            'price_pkr' => $request->price_pkr,
-            'saving_price' => $request->saving_price ?? 0,
             'features' => $features,
-            'discount_percent' => $request->discount_percent ?? 0,
-            'tax_percent' => $request->tax_percent ?? 10,
+            'tax_percent' => 0,
             'is_active' => (int) $request->is_active,
-        ]);
+        ], $pricing));
 
         return redirect()->route('admin.subscriptions.index')->with('success', 'Subscription plan created successfully.');
     }
@@ -150,32 +157,31 @@ class SubscriptionController extends Controller
             'plan_type' => 'required|in:' . implode(',', Subscription::planTypeKeys()),
             'duration_months' => 'required|integer|min:1',
             'duration_unit' => 'required|in:days,months',
-            'price_pkr' => 'required|numeric|min:0',
-            'saving_price' => 'nullable|numeric|min:0',
-            'discount_percent' => 'nullable|integer|min:0|max:100',
-            'tax_percent' => 'nullable|integer|min:0|max:100',
+            'original_price' => 'required|numeric|gt:0',
+            'discount_percentage' => 'required|numeric|min:0|max:100',
             'is_active' => 'required|in:0,1',
         ]);
 
         $planType = $request->plan_type;
         $features = Subscription::featureLabelsForPlanType($planType);
+        $pricing = Subscription::buildPricingPayload(
+            (float) $request->original_price,
+            (float) $request->discount_percentage
+        );
 
         // #region agent log
         @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'sub-duration', 'hypothesisId' => 'H-DUR2', 'location' => 'SubscriptionController::update', 'message' => 'update with duration unit', 'data' => ['id' => $subscription->id, 'plan_type' => $planType, 'duration' => (int) $request->duration_months, 'duration_unit' => $request->duration_unit], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
         // #endregion
 
-        $subscription->update([
+        $subscription->update(array_merge([
             'name' => Subscription::PLAN_TYPES[$planType],
             'plan_type' => $planType,
             'duration_months' => (int) $request->duration_months,
             'duration_unit' => $request->duration_unit,
-            'price_pkr' => $request->price_pkr,
-            'saving_price' => $request->saving_price ?? $subscription->saving_price ?? 0,
             'features' => $features,
-            'discount_percent' => $request->discount_percent ?? $subscription->discount_percent ?? 0,
-            'tax_percent' => $request->tax_percent ?? $subscription->tax_percent ?? 10,
+            'tax_percent' => 0,
             'is_active' => (int) $request->is_active,
-        ]);
+        ], $pricing));
 
         return redirect()->route('admin.subscriptions.index')->with('success', 'Subscription plan updated successfully.');
     }

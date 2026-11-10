@@ -19,6 +19,7 @@ use App\Http\Controllers\Admin\SettingController;
 use App\Http\Controllers\CityController;
 use App\Http\Controllers\CountryController;
 use App\Http\Controllers\StateController;
+use Illuminate\Support\Facades\Broadcast;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\CacheController;
 
@@ -202,6 +203,23 @@ Route::group(['as' => 'admin.', 'prefix' => 'admin'], function () {
                 Route::resource('subscriptions', \App\Http\Controllers\Admin\SubscriptionController::class);
                 Route::post('subscriptions/change-status/{id}', [\App\Http\Controllers\Admin\SubscriptionController::class, 'changeStatus'])
                     ->name('subscriptions.change-status');
+
+                // Subscription payments (PayFast) + per-admin notifications
+                Route::get('subscription-payments', [\App\Http\Controllers\Admin\SubscriptionPaymentController::class, 'index'])
+                    ->name('subscription-payments.index');
+                Route::get('subscription-payments/{id}', [\App\Http\Controllers\Admin\SubscriptionPaymentController::class, 'show'])
+                    ->name('subscription-payments.show');
+                Route::get('subscription-payment-notifications/feed', [\App\Http\Controllers\Admin\SubscriptionPaymentNotificationController::class, 'feed'])
+                    ->name('subscription-payment-notifications.feed');
+                Route::get('subscription-payment-notifications/unread-count', [\App\Http\Controllers\Admin\SubscriptionPaymentNotificationController::class, 'unreadCount'])
+                    ->name('subscription-payment-notifications.unread-count');
+                Route::post('subscription-payment-notifications/mark-all-read', [\App\Http\Controllers\Admin\SubscriptionPaymentNotificationController::class, 'markAllRead'])
+                    ->name('subscription-payment-notifications.mark-all-read');
+                Route::post('subscription-payment-notifications/{id}/read', [\App\Http\Controllers\Admin\SubscriptionPaymentNotificationController::class, 'markRead'])
+                    ->name('subscription-payment-notifications.mark-read');
+                Route::post('broadcasting/auth', function (\Illuminate\Http\Request $request) {
+                    return Broadcast::auth($request);
+                })->middleware('auth:admin')->name('broadcasting.auth');
 
                 // Service Categories Routes
                 Route::resource('service-categories', \App\Http\Controllers\Admin\ServiceCategoryController::class)->except(['show']);

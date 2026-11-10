@@ -48,6 +48,19 @@ return [
         'key' => env('GOOGLE_MAPS_KEY'),
     ],
 
+    // Mobile social login (Google / Apple)
+    // GOOGLE_CLIENT_ID can be comma-separated for Android + iOS client IDs.
+    'google' => [
+        'client_id' => env('GOOGLE_CLIENT_ID'),
+        'client_secret' => env('GOOGLE_CLIENT_SECRET'),
+        'redirect' => env('GOOGLE_REDIRECT_URI'),
+    ],
+
+    // APPLE_CLIENT_ID = iOS bundle id and/or Services ID (comma-separated OK via APPLE_CLIENT_IDS)
+    'apple' => [
+        'client_id' => env('APPLE_CLIENT_ID'),
+    ],
+
     'firebase' => [
         'credentials' => env('FIREBASE_CREDENTIALS'),
     ],

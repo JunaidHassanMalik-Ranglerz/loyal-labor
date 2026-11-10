@@ -47,6 +47,13 @@ class Subscription extends Model
     protected $casts = [
         'features' => 'array',
         'is_active' => 'boolean',
+        'price_pkr' => 'decimal:2',
+        'saving_price' => 'decimal:2',
+        'original_price' => 'decimal:2',
+        'discount_percentage' => 'decimal:2',
+        'payable_price' => 'decimal:2',
+        'discount_percent' => 'float',
+        'tax_percent' => 'integer',
     ];
 
     public static function planTypeKeys(): array
@@ -73,6 +80,98 @@ class Subscription extends Model
             fn (array $feature) => $feature['key'],
             self::featuresForPlanType($planType)
         ));
+    }
+
+    public static function calculatePayablePrice(float $originalPrice, float $discountPercentage): float
+    {
+        $originalPrice = max(0, round($originalPrice, 2));
+        $discountPercentage = min(100, max(0, round($discountPercentage, 2)));
+        $payable = $originalPrice - ($originalPrice * $discountPercentage / 100);
+
+        return round(max(0, $payable), 2);
+    }
+
+    /**
+     * Build canonical pricing payload from admin input.
+     * Never trusts a frontend-submitted payable price.
+     */
+    public static function buildPricingPayload(float $originalPrice, float $discountPercentage): array
+    {
+        $originalPrice = max(0, round($originalPrice, 2));
+        $discountPercentage = min(100, max(0, round($discountPercentage, 2)));
+        $payablePrice = self::calculatePayablePrice($originalPrice, $discountPercentage);
+
+        return [
+            'original_price' => $originalPrice,
+            'discount_percentage' => $discountPercentage,
+            'payable_price' => $payablePrice,
+            // Legacy columns kept in sync.
+            'price_pkr' => $originalPrice,
+            'discount_percent' => (int) round($discountPercentage),
+            'saving_price' => $payablePrice,
+        ];
+    }
+
+    public function resolvedOriginalPrice(): float
+    {
+        $original = $this->original_price;
+        if ($original === null || $original === '') {
+            $original = $this->price_pkr;
+        }
+
+        return round(max(0, (float) $original), 2);
+    }
+
+    public function storedPayablePrice(): ?float
+    {
+        if ($this->payable_price !== null && $this->payable_price !== '') {
+            return round(max(0, (float) $this->payable_price), 2);
+        }
+
+        $saving = (float) ($this->saving_price ?? 0);
+        if ($saving > 0) {
+            return round($saving, 2);
+        }
+
+        return null;
+    }
+
+    public function resolvedDiscountPercentage(): float
+    {
+        $original = $this->resolvedOriginalPrice();
+        $storedPayable = $this->storedPayablePrice();
+        $storedDiscount = null;
+
+        if ($this->discount_percentage !== null && $this->discount_percentage !== '') {
+            $storedDiscount = round(min(100, max(0, (float) $this->discount_percentage)), 2);
+        } elseif ($this->discount_percent !== null && $this->discount_percent !== '') {
+            $storedDiscount = round(min(100, max(0, (float) $this->discount_percent)), 2);
+        }
+
+        // Heal legacy rows where discount is 0/missing but an old saving/payable price exists.
+        if ($original > 0 && $storedPayable !== null && $storedPayable <= $original) {
+            $fromPrices = round((($original - $storedPayable) / $original) * 100, 2);
+            $fromFormula = self::calculatePayablePrice($original, (float) ($storedDiscount ?? 0));
+
+            if ($storedDiscount === null || abs($fromFormula - $storedPayable) > 0.009) {
+                return min(100, max(0, $fromPrices));
+            }
+        }
+
+        if ($storedDiscount !== null) {
+            return $storedDiscount;
+        }
+
+        return 0.0;
+    }
+
+    public function resolvedPayablePrice(): float
+    {
+        // Always calculate from original + discount. Never trust a stale payable/saving value alone.
+        return self::calculatePayablePrice(
+            $this->resolvedOriginalPrice(),
+            $this->resolvedDiscountPercentage()
+        );
     }
 
     public function getPlanTypeLabelAttribute(): string
@@ -133,30 +232,108 @@ class Subscription extends Model
     public function toApiArray(): array
     {
         $planType = $this->plan_type ?? 'basic_plan';
-        $originalPrice = (float) $this->price_pkr;
-        $savingPrice = (float) ($this->saving_price ?? 0);
-        $payablePrice = $savingPrice > 0 ? $savingPrice : $originalPrice;
-        $discountPercent = $originalPrice > 0 && $savingPrice > 0 && $savingPrice < $originalPrice
-            ? (int) round((($originalPrice - $savingPrice) / $originalPrice) * 100)
-            : (int) ($this->discount_percent ?? 0);
+        $originalPrice = $this->resolvedOriginalPrice();
+        $discountPercentage = $this->resolvedDiscountPercentage();
+        $payablePrice = $this->resolvedPayablePrice();
+
+        $discountAmount = round(max(0, $originalPrice - $payablePrice), 2);
 
         return [
             'id' => $this->id,
             'name' => $this->name ?: ($this->plan_type_label),
+            'plan_name' => $this->name ?: ($this->plan_type_label),
             'plan_type' => $planType,
             'plan_type_label' => $this->plan_type_label,
             'duration' => $this->duration_value,
             'duration_months' => $this->duration_value,
             'duration_unit' => $this->duration_unit,
             'duration_label' => $this->duration_label,
-            'price_pkr' => $originalPrice,
-            'saving_price' => $savingPrice,
+            // Primary pricing fields (use these in app UI).
+            'original_price' => $originalPrice,
+            'discount_percentage' => $discountPercentage,
+            'discount_amount' => $discountAmount,
             'payable_price' => $payablePrice,
-            'discount_percent' => $discountPercent,
-            'tax_percent' => (int) ($this->tax_percent ?? 0),
+            'currency' => 'PKR',
+            'status' => $this->is_active ? 'active' : 'inactive',
+            // Legacy keys (compat only):
+            // price_pkr = original_price
+            // saving_price = payable_price (NOT "discount amount")
+            // discount_percent = discount_percentage
+            'price_pkr' => $originalPrice,
+            'saving_price' => $payablePrice,
+            'discount_percent' => $discountPercentage,
+            'tax_percent' => 0,
             'features' => $this->resolvedFeatureLabels(),
             'feature_keys' => self::featureKeysForPlanType($planType),
             'is_active' => (bool) $this->is_active,
+        ];
+    }
+
+    public function toOrderSummaryArray(): array
+    {
+        $plan = $this->toApiArray();
+        $originalPrice = (float) $plan['original_price'];
+        $payablePrice = (float) $plan['payable_price'];
+        $discountPercentage = (float) $plan['discount_percentage'];
+
+        if ($payablePrice < 0 || $payablePrice > $originalPrice) {
+            $payablePrice = self::calculatePayablePrice($originalPrice, $discountPercentage);
+        }
+
+        $discountAmount = round(max(0, $originalPrice - $payablePrice), 2);
+        $taxPercent = 0;
+        $taxAmount = 0.0;
+        $total = $payablePrice;
+        $money = static fn (float $amount): string => 'PKR ' . number_format($amount, 2);
+
+        $name = (string) $plan['name'];
+        $durationLabel = (string) $plan['duration_label'];
+        $planLabel = trim($name . ($durationLabel !== '' ? ' (' . $durationLabel . ')' : ''));
+
+        return [
+            'id' => $plan['id'],
+            'badge' => strtoupper((string) $plan['plan_type_label']) . ' PLAN',
+            'name' => $name,
+            'plan_name' => $name,
+            'plan_type' => $plan['plan_type'],
+            'plan_type_label' => $plan['plan_type_label'],
+            'duration' => $plan['duration'],
+            'duration_unit' => $plan['duration_unit'],
+            'duration_label' => $durationLabel,
+            'original_price' => $originalPrice,
+            'original_price_label' => $money($originalPrice),
+            'discount_percentage' => $discountPercentage,
+            'payable_price' => $payablePrice,
+            'payable_price_label' => $money($payablePrice),
+            'currency' => 'PKR',
+            'save_amount' => $discountAmount,
+            'save_label' => 'Save ' . $money($discountAmount),
+            'features' => $plan['features'],
+            'feature_keys' => $plan['feature_keys'],
+            'price_breakdown' => [
+                'plan_label' => $planLabel,
+                'plan_price' => $originalPrice,
+                'plan_price_label' => $money($originalPrice),
+                'discount_percent' => $discountPercentage,
+                'discount_percentage' => $discountPercentage,
+                'discount_amount' => $discountAmount,
+                'discount_label' => 'Discount (' . rtrim(rtrim(number_format($discountPercentage, 2, '.', ''), '0'), '.') . '%)',
+                'discount_amount_label' => '- ' . $money($discountAmount),
+                'tax_percent' => $taxPercent,
+                'tax_amount' => $taxAmount,
+                'tax_label' => 'Tax (' . $taxPercent . '%)',
+                'tax_amount_label' => $money($taxAmount),
+                'total' => $total,
+                'total_label' => $money($total),
+            ],
+            'payment_methods' => [
+                ['key' => 'bank_transfer', 'label' => 'Bank Transfer'],
+                ['key' => 'easypaisa', 'label' => 'EasyPaisa'],
+            ],
+            'cancellation_policy' => [
+                'title' => 'Cancellation Policy',
+                'message' => 'Non-refundable after 24 hours of activation.',
+            ],
         ];
     }
 }

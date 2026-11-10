@@ -4,18 +4,24 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Booking;
+use App\Models\District;
+use App\Models\SocialiteCredential;
 use App\Models\TechnicianAvailability;
 use App\Models\TechnicianWorkGallery;
 use App\Models\User;
 use App\Models\UserSavedAddress;
+use App\Services\SocialAuthService;
+use App\Support\UserLocation;
 use App\Traits\GlobalMailTrait;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Stripe\Review;
+use UnexpectedValueException;
 
 class AuthController extends Controller
 {
@@ -79,6 +85,13 @@ public function register(Request $request)
             'work_gallery_captions' => 'nullable|array',
             'work_gallery_captions.*' => 'nullable|string|max:255',
             'shop_reference_code' => 'nullable|string|exists:shops,reference_code',
+            'latitude' => 'nullable|numeric|between:-90,90',
+            'longitude' => 'nullable|numeric|between:-180,180',
+            'lat' => 'nullable|numeric|between:-90,90',
+            'lng' => 'nullable|numeric|between:-180,180',
+            'long' => 'nullable|numeric|between:-180,180',
+            'fcmtoken' => 'nullable|string|max:255',
+            'fcm_token' => 'nullable|string|max:255',
         ];
         
         // Add availability validation only if provided
@@ -229,7 +242,8 @@ public function register(Request $request)
             // Existing response remains exactly the same
             'fcmtoken' => $request->fcmtoken ?? $request->fcm_token ?? '',
             'address' => $request->address ?? '',
-
+            'latitude' => null,
+            'longitude' => null,
             'district_id' => $request->district_id,
             'password' => Hash::make($request->password),
             'otp' => $otp,
@@ -249,6 +263,14 @@ public function register(Request $request)
             'shop_reference_code' => $request->shop_reference_code,
             'referral_shop_id' => $referralShopId,
         ];
+
+        [$latitude, $longitude] = UserLocation::coordinatesFromRequest($request);
+        if (Schema::hasColumn('users', 'latitude')) {
+            $userData['latitude'] = $latitude;
+            $userData['longitude'] = $longitude;
+        } else {
+            unset($userData['latitude'], $userData['longitude']);
+        }
 
         // ============================================================
         // ✅ ONLY NEW ADDITION:
@@ -627,6 +649,8 @@ public function registerresendOtp(Request $request)
 
         \Log::info('OTP verified, saving user to users table', ['email' => $email]);
 
+        UserLocation::ensureColumns();
+
         // ✅ CREATE USER IN DATABASE
         $user = User::create($userData);
 
@@ -728,10 +752,20 @@ public function registerresendOtp(Request $request)
 }
     public function login(Request $request)
     {
+        $request->merge([
+            'latitude' => $request->input('latitude', $request->input('lat')),
+            'longitude' => $request->input('longitude', $request->input('lng', $request->input('long'))),
+            'fcmtoken' => $request->input('fcmtoken', $request->input('fcm_token')),
+        ]);
+
         $request->validate([
             'user_type' => 'required|in:customer,technician',
             'email' => 'required|email',
             'password' => 'required',
+            'latitude' => 'required|numeric|between:-90,90',
+            'longitude' => 'required|numeric|between:-180,180',
+            'fcmtoken' => 'nullable|string|max:255',
+            'fcm_token' => 'nullable|string|max:255',
         ]);
 
         $user = User::where('email', $request->email)->first();
@@ -757,12 +791,212 @@ public function registerresendOtp(Request $request)
             return response()->json(['error' => 'Verify email first'], 401);
         }
 
+        UserLocation::save(
+            $user,
+            (float) $request->latitude,
+            (float) $request->longitude,
+            UserLocation::fcmTokenFromRequest($request)
+        );
+        $user->refresh();
+
         return response()->json([
-			'message' => 'Logged in successfully',
+            'message' => 'Logged in successfully',
             'user' => $user,
+            'latitude' => $user->latitude !== null ? (float) $user->latitude : null,
+            'longitude' => $user->longitude !== null ? (float) $user->longitude : null,
             'token' => $user->createToken('auth')->plainTextToken,
         ]);
     }
+
+    // POST /api/login/google
+    public function loginWithGoogle(Request $request, SocialAuthService $socialAuth)
+    {
+        return $this->handleSocialLogin($request, $socialAuth, 'google');
+    }
+
+    // POST /api/login/apple
+    public function loginWithApple(Request $request, SocialAuthService $socialAuth)
+    {
+        return $this->handleSocialLogin($request, $socialAuth, 'apple');
+    }
+
+    // POST /api/social-login  (provider = google|apple)
+    public function socialLogin(Request $request, SocialAuthService $socialAuth)
+    {
+        $request->validate([
+            'provider' => 'required|in:google,apple',
+        ]);
+
+        return $this->handleSocialLogin($request, $socialAuth, $request->provider);
+    }
+
+    private function handleSocialLogin(Request $request, SocialAuthService $socialAuth, string $provider)
+    {
+        $request->merge([
+            'latitude' => $request->input('latitude', $request->input('lat')),
+            'longitude' => $request->input('longitude', $request->input('lng', $request->input('long'))),
+            'fcmtoken' => $request->input('fcmtoken', $request->input('fcm_token')),
+            'id_token' => $request->input('id_token', $request->input('identity_token', $request->input('token'))),
+        ]);
+
+        $request->validate([
+            'user_type' => 'required|in:customer,technician',
+            'id_token' => 'required|string',
+            'name' => 'nullable|string|max:255',
+            'email' => 'nullable|email',
+            'phone' => 'nullable|string|max:50',
+            'district_id' => 'nullable|exists:districts,id',
+            'latitude' => 'nullable|numeric|between:-90,90',
+            'longitude' => 'nullable|numeric|between:-180,180',
+            'fcmtoken' => 'nullable|string|max:255',
+            'fcm_token' => 'nullable|string|max:255',
+        ]);
+
+        try {
+            $identity = $provider === 'apple'
+                ? $socialAuth->verifyAppleIdentityToken(
+                    $request->id_token,
+                    $request->input('email'),
+                    $request->input('name')
+                )
+                : $socialAuth->verifyGoogleIdToken($request->id_token);
+        } catch (UnexpectedValueException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 401);
+        } catch (\Throwable $e) {
+            Log::error('Social login verify failed', [
+                'provider' => $provider,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Could not verify social login token. Please try again.',
+            ], 401);
+        }
+
+        $providerId = $identity['provider_id'];
+        $email = $identity['email'] ?: ($request->filled('email') ? strtolower(trim($request->email)) : null);
+        $name = $identity['name'] ?: ($request->input('name') ?: 'User');
+
+        $credential = SocialiteCredential::where('provider_name', $provider)
+            ->where('provider_id', $providerId)
+            ->first();
+
+        $user = $credential?->user;
+        $isNewUser = false;
+
+        if (!$user && $email) {
+            $user = User::where('email', $email)->first();
+        }
+
+        if ($user) {
+            if ($user->user_type !== $request->user_type) {
+                $correctType = ucfirst($user->user_type);
+
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Incorrect user type',
+                    'message' => "This account is registered as {$correctType}. Please select {$correctType} and try again.",
+                ], 403);
+            }
+
+            if (!$credential) {
+                $user->socialite()->create([
+                    'provider_name' => $provider,
+                    'provider_id' => $providerId,
+                    'access_token' => null,
+                    'refresh_token' => null,
+                ]);
+            }
+        } else {
+            if (!$email) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Email is required for first-time Apple/Google signup. Please share email permission and try again.',
+                ], 422);
+            }
+
+            $districtId = $request->input('district_id');
+            if (!$districtId) {
+                $districtId = District::query()->value('id');
+            }
+
+            $create = [
+                'user_type' => $request->user_type,
+                'name' => $name,
+                'email' => $email,
+                'phone' => $request->input('phone', ''),
+                'password' => Hash::make(Str::random(32)),
+                'is_verified' => true,
+                'status' => $request->user_type === 'technician' ? 'pending' : 'active',
+            ];
+
+            if (Schema::hasColumn('users', 'fcmtoken')) {
+                $create['fcmtoken'] = UserLocation::fcmTokenFromRequest($request) ?? '';
+            }
+            if (Schema::hasColumn('users', 'district_id') && $districtId) {
+                $create['district_id'] = $districtId;
+            }
+            if (Schema::hasColumn('users', 'email_verified_at')) {
+                $create['email_verified_at'] = now();
+            }
+
+            $user = User::create($create);
+            $isNewUser = true;
+
+            $user->socialite()->create([
+                'provider_name' => $provider,
+                'provider_id' => $providerId,
+                'access_token' => null,
+                'refresh_token' => null,
+            ]);
+        }
+
+        if ($request->filled('phone') && empty($user->phone)) {
+            $user->phone = $request->phone;
+        }
+        if ($request->filled('district_id') && empty($user->district_id)) {
+            $user->district_id = $request->district_id;
+        }
+        if ($request->filled('name') && ($user->name === 'User' || $user->name === '')) {
+            $user->name = $request->name;
+        }
+        $user->is_verified = true;
+        $user->save();
+
+        if ($request->filled('latitude') && $request->filled('longitude')) {
+            UserLocation::save(
+                $user,
+                (float) $request->latitude,
+                (float) $request->longitude,
+                UserLocation::fcmTokenFromRequest($request)
+            );
+        } elseif ($fcm = UserLocation::fcmTokenFromRequest($request)) {
+            UserLocation::save($user, null, null, $fcm);
+        }
+
+        $user->refresh();
+
+        $profileComplete = !empty($user->phone) && !empty($user->district_id);
+
+        return response()->json([
+            'success' => true,
+            'message' => $isNewUser
+                ? ucfirst($provider) . ' account created and logged in successfully.'
+                : 'Logged in successfully with ' . ucfirst($provider) . '.',
+            'provider' => $provider,
+            'is_new_user' => $isNewUser,
+            'profile_complete' => $profileComplete,
+            'user' => $user,
+            'latitude' => $user->latitude !== null ? (float) $user->latitude : null,
+            'longitude' => $user->longitude !== null ? (float) $user->longitude : null,
+            'token' => $user->createToken('auth')->plainTextToken,
+        ]);
+    }
+
 public function profile(Request $request)
 {
     try {
@@ -789,6 +1023,8 @@ public function profile(Request $request)
             'photo' => $user->photo ? asset($user->photo) : null,
             'address' => $user->address ?? 'Not added',
             'city' => $user->city ?? 'N/A',
+            'latitude' => $user->latitude !== null ? (float) $user->latitude : null,
+            'longitude' => $user->longitude !== null ? (float) $user->longitude : null,
 
             // ✅ Email Verified Status (Common for both)
             'email_verified' => $user->is_verified ? 'verified' : 'pending',
@@ -849,12 +1085,32 @@ public function profile(Request $request)
                 'reviews' => $reviewsCount,
             ];
 
+            // Authoritative subscription states for frontend:
+            // none | payment_pending | active | expired
+            $expired = $user->subscription_end
+                && now()->toDateString() > (string) $user->subscription_end;
+            $hasPlanSelected = (bool) $user->subscriptionPlan && (int) ($user->subscription_id ?? 0) > 0;
+            $paymentVerified = $user->isPaymentVerified();
+            $subscriptionActive = $user->hasActiveSubscription();
+
+            if ($expired && $hasPlanSelected) {
+                $lifecycleStatus = 'expired';
+            } elseif ($subscriptionActive) {
+                $lifecycleStatus = 'active';
+            } elseif ($hasPlanSelected && ($user->payment_status === 'pending' || $user->subscription === 'pending')) {
+                $lifecycleStatus = 'payment_pending';
+            } elseif ($hasPlanSelected) {
+                $lifecycleStatus = 'inactive';
+            } else {
+                $lifecycleStatus = 'none';
+            }
+
             $response['verifications'] = [
                 'cnic_front' => $user->cnic_front_verified ? 'verified' : 'pending',
                 'cnic_back' => $user->cnic_back_verified ? 'verified' : 'pending',
                 'photo' => $user->photo_verified ? 'verified' : 'pending',
                 'certificates' => $user->certificates_verified ? 'verified' : 'pending',
-                'subscription' => $user->payment_status === 'verified' ? 'verified' : 'pending',
+                'subscription' => $subscriptionActive ? 'verified' : 'pending',
             ];
 
             $response['availability'] = $user->availabilities->map(function ($avail) {
@@ -866,26 +1122,56 @@ public function profile(Request $request)
                 ];
             });
 
-            // Subscription Plan
-            if ($user->payment_status === 'verified' && $user->subscriptionPlan) {
+            // Subscription Plan — show whenever technician has purchased/selected a plan.
+            if ($user->subscriptionPlan) {
                 $plan = $user->subscriptionPlan;
-                $response['subscription_plan'] = [
-                    'name' => $plan->name,
-                    'duration' => $plan->duration_value,
-                    'duration_months' => $plan->duration_value,
-                    'duration_unit' => $plan->duration_unit,
-                    'duration_label' => $plan->duration_label,
-                    'price_pkr' => $plan->price_pkr,
-                    'saving_price' => $plan->saving_price,
-                    'discount_percent' => $plan->discount_percent,
-                    'features' => $plan->resolvedFeatureLabels(),
-                    'feature_keys' => \App\Models\Subscription::featureKeysForPlanType($plan->plan_type ?? 'basic_plan'),
-                    'status' => 'active',
-                    'expires_at' => $user->subscription_end,
-                ];
+                $planStatus = match ($lifecycleStatus) {
+                    'active' => 'active',
+                    'expired' => 'expired',
+                    'payment_pending' => 'pending',
+                    default => 'inactive',
+                };
+
+                $latestPaid = \App\Models\SubscriptionPayment::query()
+                    ->where('technician_id', $user->id)
+                    ->where('subscription_id', $plan->id)
+                    ->where('status', \App\Models\SubscriptionPayment::STATUS_PAID)
+                    ->latest('verified_at')
+                    ->first();
+
+                $expiresAt = $user->subscription_end;
+                $activatedAt = optional($latestPaid?->activated_at)->toIso8601String()
+                    ?: ($subscriptionActive && $user->updated_at
+                        ? $user->updated_at->toIso8601String()
+                        : null);
+
+                $response['subscription_plan'] = array_merge($plan->toApiArray(), [
+                    'name' => $plan->name ?: $plan->plan_type_label,
+                    'plan_name' => $plan->name ?: $plan->plan_type_label,
+                    'status' => $planStatus,
+                    'lifecycle_status' => $lifecycleStatus,
+                    'expires_at' => $expiresAt,
+                    'activated_at' => $activatedAt,
+                    // Keep legacy "verified/pending" plus RN-compatible "paid".
+                    'payment_status' => $paymentVerified
+                        ? 'paid'
+                        : ($user->payment_status ?? 'pending'),
+                    'is_payment_verified' => $paymentVerified,
+                    'is_subscription_active' => $subscriptionActive,
+                ]);
             } else {
                 $response['subscription_plan'] = null;
             }
+
+            $response['subscription_lifecycle_status'] = $lifecycleStatus;
+            // Top-level aliases expected by React Native activation checks.
+            $response['is_payment_verified'] = $paymentVerified;
+            $response['is_subscription_active'] = $subscriptionActive;
+            $response['payment_status'] = $paymentVerified
+                ? 'paid'
+                : (($user->payment_status === 'pending') ? 'pending' : ($user->payment_status ?? 'none'));
+            $response['activated_at'] = $response['subscription_plan']['activated_at'] ?? null;
+            $response['expires_at'] = $response['subscription_plan']['expires_at'] ?? null;
 
             $response['district_name'] = $user->district->name ?? 'N/A';
         }
@@ -1068,6 +1354,13 @@ public function profile(Request $request)
             'name' => 'nullable|string|max:255',
             'phone' => 'nullable|string|max:50',
             'photo' => 'nullable|image|mimes:jpeg,png,jpg|max:5120',
+            'latitude' => 'nullable|numeric|between:-90,90',
+            'longitude' => 'nullable|numeric|between:-180,180',
+            'lat' => 'nullable|numeric|between:-90,90',
+            'lng' => 'nullable|numeric|between:-180,180',
+            'long' => 'nullable|numeric|between:-180,180',
+            'fcmtoken' => 'nullable|string|max:255',
+            'fcm_token' => 'nullable|string|max:255',
         ];
 
         if ($user->user_type === 'technician') {
@@ -1098,6 +1391,7 @@ public function profile(Request $request)
         }
 
         $user->update($data);
+        UserLocation::saveFromRequest($user, $request);
         $user = $user->fresh();
         $savedAddresses = SavedAddressController::listForUser((int) $user->id);
 
@@ -1115,6 +1409,8 @@ public function profile(Request $request)
                 'email' => $user->email,
                 'phone' => $user->phone,
                 'photo' => $user->photo ? asset($user->photo) : null,
+                'latitude' => $user->latitude !== null ? (float) $user->latitude : null,
+                'longitude' => $user->longitude !== null ? (float) $user->longitude : null,
                 'bio' => $user->bio,
                 'experience' => $user->experience,
                 'member_since' => $user->memberSince(),
@@ -1131,6 +1427,44 @@ public function profile(Request $request)
                     'items' => $savedAddresses,
                 ],
             ],
+        ]);
+    }
+
+    public function updateLocation(Request $request)
+    {
+        // Accept form-data / JSON: latitude+longitude OR lat+lng/long
+        $request->merge([
+            'latitude' => $request->input('latitude', $request->input('lat')),
+            'longitude' => $request->input('longitude', $request->input('lng', $request->input('long'))),
+        ]);
+
+        $request->validate([
+            'latitude' => 'required|numeric|between:-90,90',
+            'longitude' => 'required|numeric|between:-180,180',
+            'fcmtoken' => 'nullable|string|max:255',
+            'fcm_token' => 'nullable|string|max:255',
+        ]);
+
+        $user = $request->user();
+        UserLocation::save(
+            $user,
+            (float) $request->latitude,
+            (float) $request->longitude,
+            UserLocation::fcmTokenFromRequest($request)
+        );
+        $user->refresh();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Location saved successfully.',
+            'data' => [
+                'user_id' => $user->id,
+                'latitude' => (float) $user->latitude,
+                'longitude' => (float) $user->longitude,
+            ],
+            'latitude' => (float) $user->latitude,
+            'longitude' => (float) $user->longitude,
+            'fcm_saved' => UserLocation::fcmTokenFromRequest($request) !== null,
         ]);
     }
 

@@ -43,6 +43,20 @@ class FcmPushService
                             'body' => $body,
                         ],
                         'data' => $stringData,
+                        'android' => [
+                            'priority' => 'high',
+                            'notification' => [
+                                'sound' => 'default',
+                                'click_action' => 'FLUTTER_NOTIFICATION_CLICK',
+                            ],
+                        ],
+                        'apns' => [
+                            'payload' => [
+                                'aps' => [
+                                    'sound' => 'default',
+                                ],
+                            ],
+                        ],
                     ],
                 ]);
 

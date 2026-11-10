@@ -32,20 +32,16 @@
                                 </tr>
                                 <tr>
                                     <th>{{ __('Original Price (PKR)') }}</th>
-                                    <td>{{ number_format($subscription->price_pkr, 2) }}</td>
+                                    <td>{{ number_format($subscription->resolvedOriginalPrice(), 2) }}</td>
                                 </tr>
                                 <tr>
-                                    <th>{{ __('Saving Price (PKR)') }}</th>
-                                    <td>{{ $subscription->saving_price ? number_format($subscription->saving_price, 2) : __('N/A') }}</td>
-                                </tr>
-                                <!-- <tr>
-                                    <th>{{ __('Discount %') }}</th>
-                                    <td>{{ $subscription->discount_percent ?? 0 }}%</td>
+                                    <th>{{ __('Discount (%)') }}</th>
+                                    <td>{{ number_format($subscription->resolvedDiscountPercentage(), 2) }}%</td>
                                 </tr>
                                 <tr>
-                                    <th>{{ __('Tax %') }}</th>
-                                    <td>{{ $subscription->tax_percent ?? 0 }}%</td>
-                                </tr> -->
+                                    <th>{{ __('Payable Price (PKR)') }}</th>
+                                    <td>{{ number_format($subscription->resolvedPayablePrice(), 2) }}</td>
+                                </tr>
                                 <tr>
                                     <th>{{ __('Status') }}</th>
                                     <td>

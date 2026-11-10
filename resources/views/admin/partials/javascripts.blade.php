@@ -22,6 +22,7 @@
 <script src="{{ asset_ver('backend/js/datatables.min.js') }}"></script>
 <script src="{{ asset_ver('backend/js/datatable-common.js') }}"></script>
 @include('admin.partials.password-toggle')
+@include('admin.partials.subscription-payment-notifications-scripts')
 
 <script>
     @session('message')

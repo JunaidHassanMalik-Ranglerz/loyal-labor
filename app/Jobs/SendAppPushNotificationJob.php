@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\AppNotification;
 use App\Models\User;
 use App\Models\UserNotification;
+use App\Services\FcmPushService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -70,28 +71,25 @@ class SendAppPushNotificationJob implements ShouldQueue
 
     private function sendViaFcmStub(User $user, UserNotification $notification): void
     {
-        // Google FCM structure placeholder — wire Firebase SDK / HTTP v1 API here later.
-        $payload = [
-            'to' => $user->fcmtoken ?: null,
-            'notification' => [
-                'title' => $notification->title,
-                'body' => $notification->body,
-            ],
-            'data' => array_merge([
-                'notification_id' => (string) $notification->id,
-                'type' => $notification->type,
-            ], $notification->data ?? []),
-        ];
+        $data = array_merge([
+            'notification_id' => (string) $notification->id,
+            'type' => $notification->type,
+        ], $notification->data ?? []);
 
         if (empty($user->fcmtoken)) {
             $notification->update(['push_status' => 'skipped']);
-            Log::info('App push skipped — no FCM token', ['user_id' => $user->id, 'payload' => $payload]);
+            Log::info('App push skipped — no FCM token', ['user_id' => $user->id]);
 
             return;
         }
 
-        // TODO: Replace with Firebase Cloud Messaging HTTP call.
-        Log::info('App push queued (FCM stub)', ['user_id' => $user->id, 'payload' => $payload]);
-        $notification->update(['push_status' => 'sent']);
+        $sent = app(FcmPushService::class)->sendToToken(
+            $user->fcmtoken,
+            $notification->title,
+            $notification->body,
+            $data
+        );
+
+        $notification->update(['push_status' => $sent ? 'sent' : 'failed']);
     }
 }

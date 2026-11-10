@@ -33,7 +33,9 @@
                                             <th>{{ __('SN') }}</th>
                                             <th>{{ __('Plan Name') }}</th>
                                             <th>{{ __('Duration') }}</th>
-                                            <th>{{ __('Price (PKR)') }}</th>
+                                            <th>{{ __('Original Price') }}</th>
+                                            <th>{{ __('Discount') }}</th>
+                                            <th>{{ __('Payable Price') }}</th>
                                             <th>{{ __('Status') }}</th>
                                             <th>{{ __('Action') }}</th>
                                         </tr>
@@ -80,7 +82,9 @@
             initServerDataTable('#subscriptionTable', "{{ route('admin.subscriptions.index') }}", [
                 { data: 'name', name: 'name' },
                 { data: 'duration_months', name: 'duration_months' },
-                { data: 'price_pkr', name: 'price_pkr' },
+                { data: 'original_price_display', name: 'original_price', orderable: false, searchable: false },
+                { data: 'discount_display', name: 'discount_percentage', orderable: false, searchable: false },
+                { data: 'payable_price_display', name: 'payable_price', orderable: false, searchable: false },
                 { data: 'status_toggle', name: 'is_active', orderable: false, searchable: false },
                 { data: 'action', name: 'action', orderable: false, searchable: false },
             ]);

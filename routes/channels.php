@@ -56,3 +56,19 @@ Broadcast::channel('livechat.{id}', function ($user, $id) {
 Broadcast::channel('trackactiveuser', function ($user) {
     return $user->only('id');
 });
+
+/*
+| Admin private channel (PayFast subscription payment notifications).
+| Authenticated via /admin/broadcasting/auth (auth:admin).
+*/
+Broadcast::channel('admin.{adminId}', function ($user, $adminId) {
+    if ($user instanceof \App\Models\Admin) {
+        return (int) $user->id === (int) $adminId && $user->status === 'active';
+    }
+
+    // Fallback if default guard resolves an Admin unexpectedly.
+    $admin = auth('admin')->user();
+    return $admin
+        && (int) $admin->id === (int) $adminId
+        && $admin->status === 'active';
+});

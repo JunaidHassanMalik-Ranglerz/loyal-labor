@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BookingController;
 use App\Http\Controllers\Api\DistrictController;
 use App\Http\Controllers\Api\HelpSupportController;
+use App\Http\Controllers\Api\PayFastPaymentController;
 use App\Http\Controllers\Api\TechnicianController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -26,6 +27,9 @@ Route::get('/', function () {
             'POST /api/register-verify-otp',
             'POST /api/verify-otp',
             'POST /api/login',
+            'POST /api/login/google',
+            'POST /api/login/apple',
+            'POST /api/social-login',
             'GET  /api/districts',
             'POST /api/forgot-password',
             'POST /api/reset-password',
@@ -41,6 +45,9 @@ Route::post('/register', [AuthController::class, 'register']);
 Route::post('/register-verify-otp', [AuthController::class, 'registerVerifyOtp']);
 Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
 Route::post('/login', [AuthController::class, 'login']);
+Route::post('/login/google', [AuthController::class, 'loginWithGoogle']);
+Route::post('/login/apple', [AuthController::class, 'loginWithApple']);
+Route::post('/social-login', [AuthController::class, 'socialLogin']);
 Route::get('/districts', [DistrictController::class, 'index']);
 Route::match(['get', 'post'], '/districts/{districtId}/cities', [DistrictController::class, 'cities']);
 Route::match(['get', 'post'], '/cities', [DistrictController::class, 'cities']);
@@ -51,6 +58,19 @@ Route::get('/technicians/{technicianId}/profile', [TechnicianController::class, 
 Route::get('/technicians/{technicianId}/reviews', [\App\Http\Controllers\Api\ReviewController::class, 'technicianReviews']);
 Route::get('/skills', [TechnicianController::class, 'getSkills']);
 Route::get('/subscriptions', [TechnicianController::class, 'getSubscriptions']);
+Route::match(['get', 'post'], '/subscriptions/order-summary', [TechnicianController::class, 'subscriptionOrderSummary']);
+Route::match(['get', 'post'], '/subscriptions/{subscriptionId}/order-summary', [TechnicianController::class, 'subscriptionOrderSummary']);
+
+// PayFast Pakistan sandbox callbacks / hosted checkout (no auth — gateway redirects here)
+Route::match(['get', 'post'], '/payments/payfast/return/success', [PayFastPaymentController::class, 'returnSuccess']);
+Route::match(['get', 'post'], '/payments/payfast/return/failure', [PayFastPaymentController::class, 'returnFailure']);
+// Merchant server-to-server notification (CHECKOUT_URL).
+// Must stay under /return/* — host WAF returns empty 404 for /ipn and /notify.
+Route::match(['get', 'post'], '/payments/payfast/return/callback', [PayFastPaymentController::class, 'ipn']);
+// Legacy aliases (likely WAF-blocked on this host).
+Route::match(['get', 'post'], '/payments/payfast/notify', [PayFastPaymentController::class, 'ipn']);
+Route::match(['get', 'post'], '/payments/payfast/ipn', [PayFastPaymentController::class, 'ipn']);
+Route::get('/payments/payfast/checkout/{orderReference}', [PayFastPaymentController::class, 'checkoutPage']);
 Route::get('/get-service-category', [TechnicianController::class, 'getServiceCategory']);
 Route::match(['get', 'post'], '/service-categories/search', [TechnicianController::class, 'searchServiceCategories']);
 Route::match(['get', 'post'], '/search-service-category', [TechnicianController::class, 'searchServiceCategories']);
@@ -62,6 +82,8 @@ Route::post('/register-resend-otp', [AuthController::class, 'registerresendOtp']
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/profile', [AuthController::class, 'profile']);
     Route::post('/profile/update', [AuthController::class, 'updateProfile']);
+    Route::post('/profile/location', [AuthController::class, 'updateLocation']);
+    Route::post('/location', [AuthController::class, 'updateLocation']);
     Route::get('/addresses', [\App\Http\Controllers\Api\SavedAddressController::class, 'index']);
     Route::post('/addresses', [\App\Http\Controllers\Api\SavedAddressController::class, 'store']);
     Route::post('/addresses/{id}', [\App\Http\Controllers\Api\SavedAddressController::class, 'update']);
@@ -74,10 +96,19 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/help-support', [HelpSupportController::class, 'submit']);
 
     // Technician
+    Route::get('/technician/profile', [TechnicianController::class, 'myProfile']);
+    Route::post('/technician/profile/update', [TechnicianController::class, 'updateMyProfile']);
     Route::post('/technician/submit-verification', [TechnicianController::class, 'submitVerification']);
     Route::post('/technician/activate-subscription', [TechnicianController::class, 'activateSubscription']);
     Route::post('/technician/change-subscription-plan', [TechnicianController::class, 'changeSubscriptionPlan']);
+
+    // PayFast Pakistan — technician subscription payments (SANDBOX)
+    Route::post('/payments/payfast/initiate', [PayFastPaymentController::class, 'initiate']);
+    Route::get('/payments/{paymentId}', [PayFastPaymentController::class, 'show']);
+    Route::post('/payments/{paymentId}/verify', [PayFastPaymentController::class, 'verify']);
     Route::get('/technician/status', [TechnicianController::class, 'status']);
+    Route::get('/technician/activation', [TechnicianController::class, 'activationScreen']);
+    Route::get('/technician/activation-status', [TechnicianController::class, 'activationScreen']);
     Route::post('/technician/availability', [TechnicianController::class, 'updateAvailability']);
     Route::post('/technician/availability/toggle', [TechnicianController::class, 'toggleDayAvailability']);
     Route::post('/technician/currently-available', [TechnicianController::class, 'toggleCurrentlyAvailable']);
